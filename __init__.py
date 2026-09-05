@@ -5,7 +5,7 @@ bl_info = {
     "name": "SketchTools Free",
     "author": "Asa W Ngunja",
     "version": (1, 0, 0),
-    "blender": (5, 2, 0),
+    "blender": (4, 2, 0),
     "location": (
         "View3D > Toolbar > SketchTools"
     ),
