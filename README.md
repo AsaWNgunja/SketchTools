@@ -36,7 +36,7 @@ The Free edition includes five core drawing tools:
 
 **Blender 4.2 LTS and later**
 
-SketchTools Free 1.0 has been developed and tested with Blender 5.2 LTS.
+SketchTools Free 1.0 has been developed and tested with Blender 4.2 LTS.
 
 ## Installation
 
