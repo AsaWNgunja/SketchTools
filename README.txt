@@ -1,7 +1,7 @@
 SketchTools Free 1.0.0
 Maintainer: Asa W Ngunja
 Stable source base: v95
-Target: Blender 5.2+
+Target: Blender 4.2+
 
 Tools: Line, Rectangle, Circle, Freehand, Eraser.
 
