@@ -1,0 +1,5 @@
+PRODUCT="SketchTools Free"
+PUBLIC_VERSION="1.0.0"
+SOURCE_BASE="v95"
+COPYRIGHT="Copyright (C) 2026 Asa W Ngunja"
+LICENSE="GPL-3.0-or-later"

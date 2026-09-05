@@ -1,0 +1,27 @@
+schema_version = "1.0.0"
+
+id = "sketchtools"
+version = "1.0.0"
+name = "SketchTools Free"
+tagline = "SketchUp-style precision drawing tools for Blender"
+maintainer = "Asa W Ngunja"
+type = "add-on"
+
+blender_version_min = "5.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+copyright = [
+  "2026 Asa W Ngunja",
+]
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "/.git/",
+  "/*.zip",
+  "*.pyc",
+  "*.pyo",
+]

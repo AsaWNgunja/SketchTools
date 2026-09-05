@@ -1,0 +1,14 @@
+SketchTools Free 1.0.0
+Copyright (C) 2026 Asa W Ngunja
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later version.
+
+This program is distributed WITHOUT ANY WARRANTY; without even the implied
+warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+See https://www.gnu.org/licenses/ for the GNU General Public License.
+
+SketchTools branding identifies the original project by Asa W Ngunja.
+Modified versions should not be represented as official SketchTools releases.
