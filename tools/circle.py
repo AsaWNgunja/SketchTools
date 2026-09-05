@@ -25,6 +25,7 @@ from ..geometry.snapping import (
 )
 from ..utils.cursor import restore_cursor
 from ..utils.measurements import format_length
+from ..utils.axis_lock import PLANE_LABELS, set_world_axis_plane
 
 
 class CirclePreview(SnapFeedbackMixin):
@@ -136,11 +137,16 @@ class CircleTool(SketchToolBase):
         self._last_edit_error = None
         self.known_centers = []
         self._last_snap_type = None
+        self.axis_lock = None
+        self._base_plane_point = None
+        self._base_plane_normal = None
+        self._base_axis_u = None
+        self._base_axis_v = None
 
     def start(self, context):
         super().start(context)
         self.reset_operation()
-        self.set_status(context, "Circle: click center")
+        self.set_status(context, "Circle: click center | after center X/Y/Z: lock circle plane")
 
     def _redraw(self, context):
         if context.screen:
@@ -959,9 +965,14 @@ class CircleTool(SketchToolBase):
                 self.set_status(context, "Circle: could not establish drawing plane")
                 return
 
+            self._base_plane_point = self.drawing_plane_point.copy()
+            self._base_plane_normal = self.drawing_plane_normal.copy()
+            self._base_axis_u = self.axis_u.copy()
+            self._base_axis_v = self.axis_v.copy()
+            self.axis_lock = None
             self.state = "DRAWING"
             self.preview.clear_snap_point()
-            self.set_status(context, "Circle: click radius")
+            self._set_axis_status(context)
             return
 
         # Commit the visible preview exactly as drawn.
@@ -985,7 +996,7 @@ class CircleTool(SketchToolBase):
             if self._create_circle_in_edit_face(context, obj, points):
                 self.known_centers.append(self.center.copy())
                 self.reset_operation()
-                self.set_status(context, "Circle: click center")
+                self.set_status(context, "Circle: click center | after center X/Y/Z: lock circle plane")
                 self._redraw(context)
             else:
                 self.set_status(
@@ -1044,8 +1055,51 @@ class CircleTool(SketchToolBase):
         )
         self._redraw(context)
 
+    def _set_axis_status(self, context):
+        if self.state != "DRAWING":
+            self.set_status(context, "Circle: click center | after center X/Y/Z: lock circle plane")
+            return
+        if self.axis_lock:
+            axis = self.axis_lock
+            plane = PLANE_LABELS[axis]
+            self.set_status(
+                context,
+                f"Circle | {axis} PLANE LOCKED ({plane}) | LMB: set radius | {axis}: unlock | X/Y/Z: switch plane | RMB: cancel",
+            )
+        else:
+            self.set_status(context, "Circle: click radius | X/Y/Z: lock plane | RMB: cancel")
+
+    def _toggle_axis_lock(self, context, axis):
+        if self.state != "DRAWING" or self.center is None:
+            return False
+        if context.mode == 'EDIT_MESH':
+            self.set_status(context, "Circle: face plane is fixed in Edit Mode | X/Y/Z plane lock available in Object Mode")
+            return True
+
+        axis = axis.upper()
+        if self.axis_lock == axis:
+            self.axis_lock = None
+            if self._base_plane_point is not None:
+                self.drawing_plane_point = self._base_plane_point.copy()
+                self.drawing_plane_normal = self._base_plane_normal.copy()
+                self.axis_u = self._base_axis_u.copy()
+                self.axis_v = self._base_axis_v.copy()
+        else:
+            self.axis_lock = axis
+            set_world_axis_plane(self, axis, self.center)
+
+        self.preview.clear()
+        self._last_snap_type = None
+        self._set_axis_status(context)
+        self._redraw(context)
+        return True
+
     def on_key_press(self, context, event):
-        """SketchUp-style post-create segment entry, e.g. 48s + Enter."""
+        """Axis-plane locking while drawing; segment entry while ready."""
+        if event.type in {'X', 'Y', 'Z'} and self.state == "DRAWING":
+            return self._toggle_axis_lock(context, event.type)
+
+        # SketchUp-style post-create segment entry, e.g. 48s + Enter.
         if self.state != "READY" or not self.last_circle_name:
             return False
 
@@ -1062,7 +1116,7 @@ class CircleTool(SketchToolBase):
 
         if event.type in {'ESC'}:
             self.segment_input = ""
-            self.set_status(context, "Circle: click center")
+            self.set_status(context, "Circle: click center | after center X/Y/Z: lock circle plane")
             return True
 
         if event.type in {'RET', 'NUMPAD_ENTER'}:
@@ -1097,7 +1151,7 @@ class CircleTool(SketchToolBase):
     def on_right_click(self, context, event):
         if self.state == "DRAWING":
             self.reset_operation()
-            self.set_status(context, "Circle: click center")
+            self.set_status(context, "Circle: click center | after center X/Y/Z: lock circle plane")
             self._redraw(context)
         else:
             tool_manager.cancel(context)
@@ -1125,4 +1179,9 @@ class CircleTool(SketchToolBase):
         self.target_edit_face_signature = None
         self._last_edit_error = None
         self._last_snap_type = None
+        self.axis_lock = None
+        self._base_plane_point = None
+        self._base_plane_normal = None
+        self._base_axis_u = None
+        self._base_axis_v = None
         self.preview.clear()

@@ -31,6 +31,11 @@ from ..utils.geometry_object import (
     get_or_create_geometry_object
 )
 from ..utils.measurements import format_length, parse_length
+from ..utils.axis_lock import (
+    axis_vector,
+    closest_point_on_axis_to_view_ray,
+    AXIS_SNAP_TYPES,
+)
 
 from ..core.tool_base import SketchToolBase
 
@@ -62,6 +67,9 @@ class LineTool(SketchToolBase):
         self.last_segment_obj_name = None
         self.length_input = ""
 
+        # Explicit world-axis lock.  X/Y/Z toggles the current segment onto
+        # that axis through start_point; pressing the same key again unlocks.
+        self.axis_lock = None
 
 
     # -------------------------------------
@@ -78,6 +86,7 @@ class LineTool(SketchToolBase):
         self.reset()
 
         set_pencil_cursor()
+        self.set_status(context, "Line: click first point | X/Y/Z after first point: lock axis")
         
         debug_print(
             "Line Tool Active"
@@ -128,10 +137,58 @@ class LineTool(SketchToolBase):
             "Z_GRID": "Z_AXIS",
         }.get(self._last_snap_type)
 
+    def _update_axis_guide(self, current_point):
+        """Draw the active/inferred world-axis guide through the segment anchor."""
+        if self.state != "DRAWING" or self.start_point is None or current_point is None:
+            self.preview.clear_axis_guide()
+            return
+
+        axis_name = self.axis_lock
+        if axis_name is None:
+            axis_name = {
+                "X_AXIS": "X", "X_GRID": "X",
+                "Y_AXIS": "Y", "Y_GRID": "Y",
+                "Z_AXIS": "Z", "Z_GRID": "Z",
+            }.get(self._last_snap_type)
+
+        if axis_name is None:
+            self.preview.clear_axis_guide()
+            return
+
+        start = Vector(self.start_point)
+        end = Vector(current_point)
+        a = axis_vector(axis_name)
+        amount = (end - start).dot(a)
+        sign = 1.0 if amount >= 0.0 else -1.0
+        axis = a * sign
+        span = max(abs(amount), 0.5)
+        guide_start = start - axis * (span * 0.20)
+        guide_end = end + axis * (span * 0.35)
+        self.preview.set_axis_guide(guide_start, guide_end, AXIS_SNAP_TYPES[axis_name])
+
+    def _locked_axis_point(self, context, event):
+        if self.axis_lock is None or self.start_point is None:
+            return None
+        ray_origin, ray_direction = get_view_ray(context, event)
+        point = closest_point_on_axis_to_view_ray(
+            ray_origin, ray_direction, self.start_point, self.axis_lock
+        )
+        self._last_snap_type = AXIS_SNAP_TYPES[self.axis_lock]
+        self.preview.set_snap_point(point)
+        self.preview.set_snap_feedback(
+            f"{self.axis_lock} Axis Locked",
+            event.mouse_region_x, event.mouse_region_y,
+        )
+        return point
+
     def _snap(self, context, event):
         start_snap = self._start_point_snap(context, event)
         if start_snap is not None:
             return start_snap
+
+        locked = self._locked_axis_point(context, event)
+        if locked is not None:
+            return locked
 
         snap = resolve_snap(
             context,
@@ -568,6 +625,7 @@ class LineTool(SketchToolBase):
         current_point = self._snap(context, event)
 
         if current_point is None and self.state == "DRAWING":
+            self.preview.clear_axis_guide()
             current_point = mouse_to_plane(
                 context,
                 event,
@@ -576,7 +634,9 @@ class LineTool(SketchToolBase):
             )
 
         if current_point is not None and self.state == "DRAWING":
-            current_point = self._equal_length_inference(context, event, current_point)
+            if self.axis_lock is None:
+                current_point = self._equal_length_inference(context, event, current_point)
+            self._update_axis_guide(current_point)
             self.preview.set_points(self.start_point, current_point)
             self.preview.set_measurement_feedback(
                 "Length: " + format_length(context, (Vector(current_point) - Vector(self.start_point)).length),
@@ -613,7 +673,7 @@ class LineTool(SketchToolBase):
             debug_print("Invalid point")
             return
 
-        if self.state == "DRAWING":
+        if self.state == "DRAWING" and self.axis_lock is None:
             point = self._equal_length_inference(context, event, point)
 
         # Planar snaps stay on the established drawing plane. In Perspective
@@ -630,6 +690,7 @@ class LineTool(SketchToolBase):
             self.start_point = point
             self.points.append(point)
             self.state = "DRAWING"
+            self.set_status(context, "Line: click next point | X/Y/Z: lock axis")
             debug_print("Line started:", point)
             debug_print("Drawing plane established")
             return
@@ -673,7 +734,10 @@ class LineTool(SketchToolBase):
                 self.drawing_plane_point = None
                 self.drawing_plane_normal = None
                 self.points.clear()
+                self.axis_lock = None
+                self._last_snap_type = None
                 self.state = "READY"
+                self.set_status(context, "Line: click first point | X/Y/Z after first point: lock axis")
                 debug_print("Polygon finished - Line Tool still active")
                 return
 
@@ -690,6 +754,7 @@ class LineTool(SketchToolBase):
             self.start_point = point
             self._last_snap_type = None
             self.preview.clear_equal_length_guide()
+            self.preview.clear_axis_guide()
             if context.mode != 'EDIT_MESH':
                 # Continue free drawing on a plane parallel to the original
                 # one but passing through the newest anchor. This prevents a
@@ -697,6 +762,7 @@ class LineTool(SketchToolBase):
                 # to the old Z level.
                 self.drawing_plane_point = Vector(point)
             self.end_point = None
+            self._set_axis_status(context)
 
     # -------------------------------------
     # Right Click / Cancel
@@ -723,6 +789,8 @@ class LineTool(SketchToolBase):
         self.points.clear()
 
         self.state = "READY"
+        self.axis_lock = None
+        self.set_status(context, "Line: click first point | X/Y/Z after first point: lock axis")
 
         debug_print(
             "Line Tool still active"
@@ -766,6 +834,34 @@ class LineTool(SketchToolBase):
     # -------------------------------------
     # Keyboard
     # -------------------------------------
+
+    def _set_axis_status(self, context):
+        if self.state != "DRAWING":
+            self.set_status(context, "Line: click first point | X/Y/Z after first point: lock axis")
+            return
+        if self.axis_lock:
+            axis = self.axis_lock
+            self.set_status(
+                context,
+                f"Line | {axis} AXIS LOCKED | LMB: place point | {axis}: unlock | X/Y/Z: switch axis | RMB: cancel chain",
+            )
+        else:
+            self.set_status(context, "Line: click next point | X/Y/Z: lock axis | RMB: cancel chain")
+
+    def _toggle_axis_lock(self, context, axis):
+        if self.state != "DRAWING" or self.start_point is None:
+            return False
+        axis = axis.upper()
+        self.axis_lock = None if self.axis_lock == axis else axis
+        self._last_snap_type = AXIS_SNAP_TYPES.get(self.axis_lock) if self.axis_lock else None
+        if self.axis_lock is None:
+            self.preview.clear_axis_guide()
+            self.preview.clear_snap_feedback()
+        self._set_axis_status(context)
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+        return True
 
     def _adjust_last_segment_length(self, context, new_length):
         if (
@@ -822,6 +918,10 @@ class LineTool(SketchToolBase):
         return True
 
     def on_key_press(self, context, event):
+        if event.type in {'X', 'Y', 'Z'} and not self.length_input:
+            if self._toggle_axis_lock(context, event.type):
+                return True
+
         # After a segment is placed, typing a value and Enter adjusts that most
         # recent segment along its established direction (SketchUp behaviour).
         if self.last_segment_start is None or self.last_segment_end is None:
@@ -974,6 +1074,7 @@ class LineTool(SketchToolBase):
         self.last_segment_end = None
         self.last_segment_obj_name = None
         self.length_input = ""
+        self.axis_lock = None
         
         self.state = "READY"
         

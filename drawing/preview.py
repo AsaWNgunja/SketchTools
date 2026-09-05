@@ -20,6 +20,12 @@ class PreviewLine(SnapFeedbackMixin):
         self.equal_current_mid = None
         self.equal_reference_mid = None
 
+        # World-axis guide used by automatic inference and explicit X/Y/Z
+        # axis locks.
+        self.axis_guide_start = None
+        self.axis_guide_end = None
+        self.axis_guide_type = None
+
         self._init_snap_feedback()
 
 
@@ -59,12 +65,48 @@ class PreviewLine(SnapFeedbackMixin):
         self.equal_current_mid = None
         self.equal_reference_mid = None
 
+    def set_axis_guide(self, start, end, axis_type):
+        self.axis_guide_start = start.copy()
+        self.axis_guide_end = end.copy()
+        self.axis_guide_type = axis_type
+
+    def clear_axis_guide(self):
+        self.axis_guide_start = None
+        self.axis_guide_end = None
+        self.axis_guide_type = None
+
     def draw(self):
 
         shader = gpu.shader.from_builtin(
             "UNIFORM_COLOR"
         )
 
+
+        # ---------------------------------
+        # v96 world-axis inference guide
+        # ---------------------------------
+
+        if (
+            self.axis_guide_start is not None
+            and self.axis_guide_end is not None
+            and self.axis_guide_type in {"X_AXIS", "Y_AXIS", "Z_AXIS"}
+        ):
+            axis_batch = batch_for_shader(
+                shader,
+                "LINES",
+                {"pos": [self.axis_guide_start, self.axis_guide_end]},
+            )
+
+            gpu.state.line_width_set(2.0)
+            shader.bind()
+            axis_colors = {
+                "X_AXIS": (1.0, 0.15, 0.15, 1.0),
+                "Y_AXIS": (0.15, 0.85, 0.20, 1.0),
+                "Z_AXIS": (0.15, 0.45, 1.0, 1.0),
+            }
+            shader.uniform_float("color", axis_colors[self.axis_guide_type])
+            axis_batch.draw(shader)
+            gpu.state.line_width_set(1.0)
 
         # ---------------------------------
         # Draw preview line

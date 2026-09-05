@@ -27,6 +27,7 @@ from ..geometry.topology import create_edge, create_face_from_points
 from ..utils.geometry_object import get_or_create_geometry_object
 from ..utils.cursor import restore_cursor
 from ..utils.measurements import format_length
+from ..utils.axis_lock import PLANE_LABELS, set_world_axis_plane
 
 
 class RectanglePreview(SnapFeedbackMixin):
@@ -91,11 +92,16 @@ class RectangleTool(SketchToolBase):
         self._last_edit_error = None
         self.preview = RectanglePreview()
         self._last_snap_type = None
+        self.axis_lock = None
+        self._base_plane_point = None
+        self._base_plane_normal = None
+        self._base_axis_u = None
+        self._base_axis_v = None
 
     def start(self, context):
         super().start(context)
         self.reset_operation()
-        self.set_status(context, "Rectangle: click first corner")
+        self.set_status(context, "Rectangle: click first corner | after first corner X/Y/Z: lock plane")
 
     def _redraw(self, context):
         if context.screen:
@@ -748,9 +754,14 @@ class RectangleTool(SketchToolBase):
             if not self._setup_plane(context, event, point):
                 return
 
+            self._base_plane_point = self.drawing_plane_point.copy()
+            self._base_plane_normal = self.drawing_plane_normal.copy()
+            self._base_axis_u = self.axis_u.copy()
+            self._base_axis_v = self.axis_v.copy()
+            self.axis_lock = None
             self.state = "DRAWING"
             self.preview.clear_snap_point()
-            self.set_status(context, "Rectangle: click opposite corner")
+            self._set_axis_status(context)
             return
 
         # SECOND CLICK: commit the rectangle that is already visible.
@@ -847,13 +858,57 @@ class RectangleTool(SketchToolBase):
         context.view_layer.update()
 
         self.reset_operation()
-        self.set_status(context, "Rectangle: click first corner")
+        self.set_status(context, "Rectangle: click first corner | after first corner X/Y/Z: lock plane")
         self._redraw(context)
+
+    def _set_axis_status(self, context):
+        if self.state != "DRAWING":
+            self.set_status(context, "Rectangle: click first corner | after first corner X/Y/Z: lock plane")
+            return
+        if self.axis_lock:
+            axis = self.axis_lock
+            plane = PLANE_LABELS[axis]
+            self.set_status(
+                context,
+                f"Rectangle | {axis} PLANE LOCKED ({plane}) | LMB: opposite corner | {axis}: unlock | X/Y/Z: switch plane | RMB: cancel",
+            )
+        else:
+            self.set_status(context, "Rectangle: click opposite corner | X/Y/Z: lock plane | RMB: cancel")
+
+    def _toggle_axis_lock(self, context, axis):
+        if self.state != "DRAWING" or self.start_point is None:
+            return False
+        if context.mode == 'EDIT_MESH':
+            self.set_status(context, "Rectangle: face plane is fixed in Edit Mode | X/Y/Z plane lock available in Object Mode")
+            return True
+
+        axis = axis.upper()
+        if self.axis_lock == axis:
+            self.axis_lock = None
+            if self._base_plane_point is not None:
+                self.drawing_plane_point = self._base_plane_point.copy()
+                self.drawing_plane_normal = self._base_plane_normal.copy()
+                self.axis_u = self._base_axis_u.copy()
+                self.axis_v = self._base_axis_v.copy()
+        else:
+            self.axis_lock = axis
+            set_world_axis_plane(self, axis, self.start_point)
+
+        self.preview.clear()
+        self._last_snap_type = None
+        self._set_axis_status(context)
+        self._redraw(context)
+        return True
+
+    def on_key_press(self, context, event):
+        if event.type in {'X', 'Y', 'Z'}:
+            return self._toggle_axis_lock(context, event.type)
+        return False
 
     def on_right_click(self, context, event):
         if self.state == "DRAWING":
             self.reset_operation()
-            self.set_status(context, "Rectangle: click first corner")
+            self.set_status(context, "Rectangle: click first corner | after first corner X/Y/Z: lock plane")
             self._redraw(context)
         else:
             tool_manager.cancel(context)
@@ -881,4 +936,9 @@ class RectangleTool(SketchToolBase):
         self.target_edit_face_signature = None
         self._last_edit_error = None
         self._last_snap_type = None
+        self.axis_lock = None
+        self._base_plane_point = None
+        self._base_plane_normal = None
+        self._base_axis_u = None
+        self._base_axis_v = None
         self.preview.clear()

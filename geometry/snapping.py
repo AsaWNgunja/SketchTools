@@ -777,9 +777,22 @@ def find_axis_inference(
             pixel_distance = (mouse - closest_screen).length
 
             allowed_angle = release_angle if snap_type == preferred_axis else acquire_angle
+
+            # v96: Vertical drawing is especially important for architectural
+            # workflows. In Perspective view the projected world-Z ray can be
+            # visually narrow, so normal hand movement could miss the old
+            # 6-degree acquisition corridor and fall back to the horizontal
+            # grid. Give true 3D Z inference a wider, still deliberate,
+            # corridor while leaving X/Y and all planar tools unchanged.
+            if world_3d and snap_type == "Z_AXIS":
+                allowed_angle = 18.0 if snap_type == preferred_axis else 14.0
+                axis_near_band = max(18.0, near_anchor_band)
+            else:
+                axis_near_band = near_anchor_band
+
             aligned = (
                 angle <= allowed_angle
-                or (mouse_len < 40.0 and pixel_distance <= near_anchor_band)
+                or (mouse_len < 40.0 and pixel_distance <= axis_near_band)
             )
             if not aligned:
                 continue

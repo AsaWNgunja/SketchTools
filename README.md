@@ -4,7 +4,7 @@
 
 SketchTools brings fast and intuitive drawing workflows to Blender's 3D Viewport, with an emphasis on precision, snapping, inference and direct geometry creation.
 
-## SketchTools Free 1.0
+## SketchTools Free 1.0.0
 
 The Free edition includes five core drawing tools:
 
@@ -21,6 +21,10 @@ The Free edition includes five core drawing tools:
 - Live measurements while drawing
 - Exact line-length input
 - X, Y and Z axis inference
+- Improved vertical Z-axis inference with blue guide
+- X/Y/Z axis locking for Line (press again to unlock; press another axis to switch)
+- X/Y/Z construction-plane locking for Rectangle and Circle in Object Mode
+- Live axis-lock instructions in Blender's status bar
 - Same-axis grid snapping
 - Endpoint and midpoint snapping
 - Equal-length inference
@@ -36,7 +40,7 @@ The Free edition includes five core drawing tools:
 
 **Blender 4.2 LTS and later**
 
-SketchTools Free 1.0 has been tested with Blender 4.2 LTS and Blender 5.2 LTS.
+SketchTools Free 1.0.0 has been tested with Blender 4.2 LTS and Blender 5.2 LTS.
 
 ## Installation
 
