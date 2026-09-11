@@ -1,4 +1,4 @@
-__build__ = 97
+__build__ = 180
 __edition__ = "Free"
 
 bl_info = {
@@ -35,6 +35,12 @@ from .operators.line_operator import (
     SketchToolsLineOperator
 )
 
+from .operators.line_native_event import (
+    SketchToolsLineNativeEventOperator,
+    shutdown_line_native_draw_service,
+)
+from .operators.native_event import SketchToolsNativeEventOperator, shutdown_native_draw_service
+
 from .operators.rectangle_operator import (
     SketchToolsRectangleOperator
 )
@@ -66,6 +72,10 @@ classes = (
 
     SketchToolsLineOperator,
 
+    SketchToolsLineNativeEventOperator,
+
+    SketchToolsNativeEventOperator,
+
     SketchToolsRectangleOperator,
 
     SketchToolsCircleOperator,
@@ -94,6 +104,19 @@ def _circle_segments_update(scene, context):
         pass
 
 
+def _circle_radius_update(scene, context):
+    """Changing Circle Radius updates the selected pristine SketchTools circle."""
+    try:
+        obj = context.active_object if context is not None else None
+        if obj is None or obj.type != 'MESH' or not obj.get("sketchtools_circle"):
+            return
+        from .tools.circle import resize_parametric_circle, circle_is_pristine
+        if circle_is_pristine(obj):
+            resize_parametric_circle(obj, float(scene.sketchtools_circle_radius))
+    except Exception:
+        pass
+
+
 # -------------------------------------
 # Register
 # -------------------------------------
@@ -115,6 +138,16 @@ def register():
         min=3,
         max=256,
         update=_circle_segments_update,
+    )
+
+    bpy.types.Scene.sketchtools_circle_radius = bpy.props.FloatProperty(
+        name="Circle Radius",
+        description="Radius of the selected pristine SketchTools circle",
+        default=1.0,
+        min=0.000001,
+        subtype='DISTANCE',
+        unit='LENGTH',
+        update=_circle_radius_update,
     )
 
     for cls in classes:
@@ -154,7 +187,11 @@ def register():
 
 def unregister():
 
-    # Stop modal GPU/UI callbacks before unregistering workspace tools/RNA classes.
+    # Stop Line native preview callbacks and legacy modal callbacks before unregister.
+    try: shutdown_line_native_draw_service()
+    except Exception: pass
+    try: shutdown_native_draw_service()
+    except Exception: pass
     try: SketchToolsModalController.shutdown_all()
     except Exception: pass
     try:
@@ -172,6 +209,9 @@ def unregister():
 
     if hasattr(bpy.types.Scene, "sketchtools_circle_segments"):
         del bpy.types.Scene.sketchtools_circle_segments
+
+    if hasattr(bpy.types.Scene, "sketchtools_circle_radius"):
+        del bpy.types.Scene.sketchtools_circle_radius
 
     for tool_cls in reversed(ALL_WORKSPACE_TOOLS):
         try:
