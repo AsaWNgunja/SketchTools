@@ -644,10 +644,10 @@ class SketchToolsModalController(
 
             show_blender_cursor(context)
 
-            return {
-                'RUNNING_MODAL',
-                'PASS_THROUGH'
-            }
+            # Do not consume events outside Blender editors.  PASS_THROUGH
+            # alone keeps this modal controller alive while allowing the
+            # window/UI keymaps to receive the event normally.
+            return {'PASS_THROUGH'}
 
 
         # -------------------------------------
@@ -658,10 +658,9 @@ class SketchToolsModalController(
 
             show_blender_cursor(context)
 
-            return {
-                'RUNNING_MODAL',
-                'PASS_THROUGH'
-            }
+            # Outliner, Timeline, Properties, etc. own these events.
+            # Keep SketchTools modal, but do not consume the event.
+            return {'PASS_THROUGH'}
 
 
         # -------------------------------------
@@ -689,21 +688,15 @@ class SketchToolsModalController(
         # Blender control win when it is actually clicked.
         click_region = raw_mouse_region
 
-        # The visually empty lower part of the N-sidebar is intentionally
-        # treated as drawable viewport, not UI.
-        if (
-            click_region is not None
-            and click_region.type == 'UI'
-            and mouse_area is not None
-            and mouse_area.type == 'VIEW_3D'
-            and not self.mouse_over_visible_sketchtools_panel(
-                context,
-                event,
-                mouse_area,
-                click_region
-            )
-        ):
-            click_region = mouse_region
+        # v106: Never reinterpret an actual View3D UI-region click as a
+        # viewport click.  The N-panel tab strip and its controls live in the
+        # same UI region, and the old visible-panel-height heuristic could
+        # classify lower tabs (including Tool / SketchTools) as WINDOW.  That
+        # made those tabs unclickable while a SketchTool was active.
+        #
+        # Hover/drawing ownership may still use the heuristic above so the
+        # pencil can remain responsive near visually empty overlay space, but
+        # CLICK ownership must follow Blender's raw region exactly.
 
         if (
             click_region is None
@@ -718,37 +711,15 @@ class SketchToolsModalController(
             # activate normally.
             show_pencil_cursor()
 
-            if (
-                event.type == 'LEFTMOUSE'
-                and
-                event.value == 'PRESS'
-            ):
+            # Blender owns all events in View3D UI regions (toolbar,
+            # header, sidebar, tool header).  Crucially, do NOT cancel the
+            # SketchTool here: passing the event through lets Blender UI work
+            # while the modal tool remains ready to resume in the viewport.
+            if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
                 show_blender_cursor(context)
+                debug_print("SketchTools: passing View3D UI click to Blender")
 
-                debug_print(
-                    "SketchTools: View3D UI click - "
-                    "releasing active SketchTool to Blender"
-                )
-
-                tool_manager.cancel(
-                    context,
-                    restore_blender_tool=False
-                )
-
-                self.cleanup()
-
-                # PASS_THROUGH is essential: this same press
-                # must still reach the Blender UI button that
-                # the user clicked.
-                return {
-                    'FINISHED',
-                    'PASS_THROUGH'
-                }
-
-            return {
-                'RUNNING_MODAL',
-                'PASS_THROUGH'
-            }
+            return {'PASS_THROUGH'}
 
 
         # -------------------------------------

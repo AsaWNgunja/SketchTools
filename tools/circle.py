@@ -3,7 +3,7 @@ import bpy
 import math
 import time
 import bmesh
-from itertools import combinations
+from itertools import product
 from mathutils import Vector
 from mathutils.bvhtree import BVHTree
 import gpu
@@ -24,8 +24,282 @@ from ..geometry.snapping import (
     snap_label,
 )
 from ..utils.cursor import restore_cursor
-from ..utils.measurements import format_length
+from ..utils.measurements import format_length, parse_length
 from ..utils.axis_lock import PLANE_LABELS, set_world_axis_plane
+from ..geometry.edit_free_geometry import create_disconnected_face
+from ..geometry.topology import insert_circle_planar_boundary_edit
+
+
+def _polygon_centroid_2d(points):
+    if not points:
+        return Vector((0.0, 0.0))
+    acc = Vector((0.0, 0.0))
+    for p in points:
+        acc += p
+    return acc / len(points)
+
+
+def _looks_like_regular_circle_loop(points, min_vertices=5):
+    """Conservative detector for an existing polygonal circle boundary.
+
+    This is intentionally local to Circle containment.  Rectangles/squares are
+    excluded by the vertex-count guard, while normal SketchTools circles (8,
+    16, 32, 64... segments) pass without requiring per-face metadata.
+    """
+    n = len(points)
+    if n < min_vertices:
+        return False
+    c = _polygon_centroid_2d(points)
+    radii = [(p - c).length for p in points]
+    mean_r = sum(radii) / n
+    if mean_r <= 1e-9:
+        return False
+    if (max(radii) - min(radii)) > mean_r * 0.10:
+        return False
+    lengths = [(points[(i + 1) % n] - points[i]).length for i in range(n)]
+    mean_l = sum(lengths) / n
+    if mean_l <= 1e-9:
+        return False
+    if (max(lengths) - min(lengths)) > mean_l * 0.30:
+        return False
+    return True
+
+
+def _rotate_loop_to_angle_zero(verts, points):
+    """Return a CCW loop rotated to its +X-most angular start."""
+    verts = list(verts)
+    points = list(points)
+    if not verts:
+        return verts, points
+    c = _polygon_centroid_2d(points)
+    angles = [math.atan2((p - c).y, (p - c).x) % (2.0 * math.pi) for p in points]
+    start = min(range(len(points)), key=lambda i: angles[i])
+    return verts[start:] + verts[:start], points[start:] + points[:start]
+
+
+def _bridge_circle_loops(bm, outer_verts, outer_2d, inner_verts, inner_2d):
+    """Create a non-crossing annulus between two ordered circular loops.
+
+    Equal counts remain a pure 1:1 quad ring. Unequal counts use a global
+    angular-sector sweep instead of a sequential/index zipper. Each boundary
+    keeps every authored vertex; no resampling or helper vertices are added.
+
+    The angular parameter is measured around each loop's own centroid against
+    the same 2D +X/+Y axes. This is important for eccentric containment: both
+    loops still advance in the same global direction, so correspondence cannot
+    accumulate rotational drift into a pinwheel/spiral.
+    """
+    outer_verts = list(outer_verts)
+    outer_2d = list(outer_2d)
+    inner_verts = list(inner_verts)
+    inner_2d = list(inner_2d)
+    no = len(outer_verts)
+    ni = len(inner_verts)
+    if no < 3 or ni < 3:
+        raise RuntimeError("circle containment requires closed loops")
+
+    def ordered_by_global_angle(verts, points):
+        c = _polygon_centroid_2d(points)
+        items = []
+        for v, p in zip(verts, points):
+            a = math.atan2((p - c).y, (p - c).x) % (2.0 * math.pi)
+            items.append((a, v, p))
+        items.sort(key=lambda item: item[0])
+        return ([item[1] for item in items],
+                [item[2] for item in items],
+                [item[0] for item in items])
+
+    outer_verts, outer_2d, outer_angles = ordered_by_global_angle(
+        outer_verts, outer_2d
+    )
+    inner_verts, inner_2d, inner_angles = ordered_by_global_angle(
+        inner_verts, inner_2d
+    )
+
+    # Equal segment counts: keep the proven clean 1:1 quad ring, but align the
+    # two loops by the cyclic offset that minimizes total angular mismatch.
+    if no == ni:
+        best_shift = 0
+        best_cost = None
+        tau = 2.0 * math.pi
+        for shift in range(no):
+            cost = 0.0
+            for i in range(no):
+                d = abs(outer_angles[i] - inner_angles[(i + shift) % ni])
+                d = min(d, tau - d)
+                cost += d * d
+            if best_cost is None or cost < best_cost:
+                best_cost = cost
+                best_shift = shift
+        if best_shift:
+            inner_verts = inner_verts[best_shift:] + inner_verts[:best_shift]
+            inner_2d = inner_2d[best_shift:] + inner_2d[:best_shift]
+
+        faces = []
+        for i in range(no):
+            j = (i + 1) % no
+            poly = (outer_verts[i], outer_verts[j], inner_verts[j], inner_verts[i])
+            try:
+                faces.append(bm.faces.new(poly))
+            except ValueError:
+                faces.append(bm.faces.new(tuple(reversed(poly))))
+        return faces
+
+    # v160 unequal containment: sparse sector-anchor topology.
+    #
+    # The loop with fewer vertices defines the number of annulus sectors.
+    # Each vertex on that smaller loop receives exactly ONE bridge to a
+    # monotonically corresponding vertex on the larger loop.  Vertices between
+    # two anchors remain on their authored boundary and are absorbed into the
+    # sector face; they do NOT each receive a radial bridge.  This is the
+    # Blender-like sparse topology requested for unequal circle counts.
+    #
+    # Anchor correspondence is solved globally.  Both loops are ordered by
+    # direction around their own centres (same world 2D axes), then we test all
+    # cyclic phases of the larger loop while keeping proportional anchor steps.
+    # The chosen phase minimizes angular mismatch.  Because anchor indices are
+    # monotonic before wrapping, bridges cannot spiral or cross, including for
+    # eccentric/non-centred containment.
+    tau = 2.0 * math.pi
+
+    def angular_delta(a, b):
+        d = abs(a - b) % tau
+        return min(d, tau - d)
+
+    def proportional_anchor_indices(n_large, n_small, shift):
+        # n_large > n_small.  floor() partitions the larger boundary into
+        # n_small stable sectors whose sizes differ by at most one vertex.
+        return [
+            (shift + int(math.floor((k * n_large) / n_small))) % n_large
+            for k in range(n_small)
+        ]
+
+    def choose_phase(large_angles, small_angles):
+        nl = len(large_angles)
+        ns = len(small_angles)
+        best = None
+        for shift in range(nl):
+            anchors = proportional_anchor_indices(nl, ns, shift)
+            # Compare corresponding global directions.  A tiny spacing term
+            # makes ties deterministic without changing the geometric choice.
+            cost = 0.0
+            for k, ai in enumerate(anchors):
+                d = angular_delta(large_angles[ai], small_angles[k])
+                cost += d * d
+            key = (cost, shift)
+            if best is None or key < best[0]:
+                best = (key, anchors)
+        return best[1]
+
+    def forward_arc(seq, start_idx, end_idx):
+        """Inclusive forward cyclic arc start -> end."""
+        out = [seq[start_idx]]
+        i = start_idx
+        guard = 0
+        while i != end_idx:
+            i = (i + 1) % len(seq)
+            out.append(seq[i])
+            guard += 1
+            if guard > len(seq):
+                raise RuntimeError("invalid circle sector arc")
+        return out
+
+    faces = []
+
+    if no > ni:
+        # Inner loop is the smaller loop: one bridge per inner vertex.
+        anchors = choose_phase(outer_angles, inner_angles)
+        for k in range(ni):
+            kn = (k + 1) % ni
+            a0 = anchors[k]
+            a1 = anchors[kn]
+            outer_arc = forward_arc(outer_verts, a0, a1)
+            # Walk outer boundary forward, bridge inward at the next sector
+            # boundary, traverse one inner edge backward, then close via the
+            # current sector bridge.
+            poly = tuple(outer_arc + [inner_verts[kn], inner_verts[k]])
+            if len(set(poly)) < 3:
+                continue
+            try:
+                faces.append(bm.faces.new(poly))
+            except ValueError:
+                faces.append(bm.faces.new(tuple(reversed(poly))))
+    else:
+        # Outer loop is the smaller loop: one bridge per outer vertex.  The
+        # larger inner boundary contributes an arc to each sector.
+        anchors = choose_phase(inner_angles, outer_angles)
+        for k in range(no):
+            kn = (k + 1) % no
+            a0 = anchors[k]
+            a1 = anchors[kn]
+            # For a correctly wound annulus face, traverse the inner boundary
+            # opposite to the outer boundary direction.
+            inner_arc_fwd = forward_arc(inner_verts, a0, a1)
+            inner_arc_back = list(reversed(inner_arc_fwd))
+            poly = tuple([outer_verts[k], outer_verts[kn]] + inner_arc_back)
+            if len(set(poly)) < 3:
+                continue
+            try:
+                faces.append(bm.faces.new(poly))
+            except ValueError:
+                faces.append(bm.faces.new(tuple(reversed(poly))))
+
+    return faces
+
+
+def _best_cyclic_boundary_anchors(outer_2d, target_2d, candidate_limit=8):
+    """Return distinct boundary indices for ordered target points without O(n^k) search.
+
+    Circle cuts only need 3 or 4 anchors.  The old implementation enumerated every
+    3/4-vertex combination on the target boundary, which becomes extremely slow
+    when the host face itself is a high-segment circle (e.g. 140 vertices).
+    This keeps only the nearest few candidates per target and tests their tiny
+    Cartesian product while preserving cyclic boundary order.
+    """
+    n = len(outer_2d)
+    k = len(target_2d)
+    if n < k or k < 1:
+        return None
+
+    limit = min(max(k, int(candidate_limit)), n)
+    ranked = []
+    for target in target_2d:
+        costs = sorted(
+            ((outer_2d[i] - target).length_squared, i) for i in range(n)
+        )
+        ranked.append(costs[:limit])
+
+    best = None
+    best_cost = None
+    for choices in product(*ranked):
+        indices = tuple(item[1] for item in choices)
+        if len(set(indices)) != k:
+            continue
+
+        # Target points are ordered around the inner loop.  Their boundary
+        # anchors must have the same cyclic order (zero or one index wrap).
+        descents = sum(1 for i in range(k) if indices[(i + 1) % k] < indices[i])
+        if descents != 1:
+            continue
+
+        cost = sum(item[0] for item in choices)
+        if best_cost is None or cost < best_cost:
+            best_cost = cost
+            best = indices
+
+    if best is not None:
+        return best
+
+    # Defensive fallback: nearest distinct vertices, then order them cyclically.
+    used = set()
+    result = []
+    for candidates in ranked:
+        pick = next((idx for _cost, idx in candidates if idx not in used), None)
+        if pick is None:
+            return None
+        used.add(pick)
+        result.append(pick)
+    return tuple(result)
 
 
 class CirclePreview(SnapFeedbackMixin):
@@ -71,13 +345,13 @@ class CirclePreview(SnapFeedbackMixin):
             gpu.state.point_size_set(1.0)
 
 
-def rebuild_parametric_circle(obj, segments):
+def rebuild_parametric_circle(obj, segments, radius_override=None):
     """Rebuild a pristine SketchTools circle without changing its transform."""
     if obj is None or obj.type != 'MESH' or not obj.get("sketchtools_circle"):
         return False
 
     segments = max(3, min(256, int(segments)))
-    radius = float(obj.get("sketchtools_circle_radius", 0.0))
+    radius = float(radius_override) if radius_override is not None else float(obj.get("sketchtools_circle_radius", 0.0))
     if radius <= 0.0:
         return False
 
@@ -98,8 +372,23 @@ def rebuild_parametric_circle(obj, segments):
     mesh.update()
 
     obj["sketchtools_circle_segments"] = segments
+    obj["sketchtools_circle_radius"] = float(radius)
     return True
 
+
+
+def resize_parametric_circle(obj, radius):
+    """Resize a pristine SketchTools circle while preserving its segment count and plane."""
+    if obj is None or obj.type != 'MESH' or not obj.get("sketchtools_circle"):
+        return False
+    try:
+        radius = float(radius)
+    except (TypeError, ValueError):
+        return False
+    if radius <= 1e-9:
+        return False
+    segments = int(obj.get("sketchtools_circle_segments", 32))
+    return rebuild_parametric_circle(obj, segments, radius_override=radius)
 
 def circle_is_pristine(obj):
     if obj is None or obj.type != 'MESH' or not obj.get("sketchtools_circle"):
@@ -142,6 +431,7 @@ class CircleTool(SketchToolBase):
         self._base_plane_normal = None
         self._base_axis_u = None
         self._base_axis_v = None
+        self.edit_free_space = False
 
     def start(self, context):
         super().start(context)
@@ -154,6 +444,21 @@ class CircleTool(SketchToolBase):
                 if area.type == 'VIEW_3D':
                     area.tag_redraw()
 
+    def _sync_segments_from_scene(self, context):
+        """Use the live N-panel segment setting for the *next* circle.
+
+        The native-event tool instance persists across successive circles.  Prior
+        builds copied the scene setting only when the Circle tool was first
+        activated, so changing Circle Segments while the tool stayed active did
+        not affect later Edit Mode circles.  Sync only while READY so a circle
+        already being drawn keeps the segment count it started with.
+        """
+        try:
+            segments = int(getattr(context.scene, "sketchtools_circle_segments", self.segments))
+        except Exception:
+            return
+        self.segments = max(3, min(256, segments))
+
     def _snap(self, context, event):
         snap = resolve_snap(
             context,
@@ -164,12 +469,19 @@ class CircleTool(SketchToolBase):
             extra_centers=getattr(self, "known_centers", None),
             inference_origin=(self.center if self.center is not None else None),
             include_face=True,
-            include_grid=(context.mode != 'EDIT_MESH'),
+            include_grid=True,
+            # v176 Circle-only center acquisition: keep shared snapping
+            # defaults unchanged for the other tools, but give visible Circle
+            # centers a larger capture radius so Center remains dependable in
+            # perspective and at practical zoom levels.
+            center_pixel_radius=28,
             preferred_axis=(
                 self._last_snap_type
                 if self._last_snap_type in {"X_AXIS", "Y_AXIS", "Z_AXIS"}
                 else None
             ),
+            previous_snap_type=self._last_snap_type,
+            snap_hysteresis_pixels=7,
         )
         if snap is not None and snap.valid:
             self._last_snap_type = snap.snap_type
@@ -198,8 +510,11 @@ class CircleTool(SketchToolBase):
         self.axis_u = axis_u
         self.axis_v = normal.cross(axis_u).normalized()
 
-        delta = Vector(center) - self.drawing_plane_point
-        self.center = Vector(center) - normal * delta.dot(normal)
+        # The snapped center is authoritative.  Move the construction plane
+        # through that exact 3D coordinate so Center/Endpoint snaps are not
+        # visually acquired and then numerically projected somewhere else.
+        self.drawing_plane_point = Vector(center).copy()
+        self.center = Vector(center).copy()
         return True
 
     def _setup_plane(self, context, event, center):
@@ -230,11 +545,15 @@ class CircleTool(SketchToolBase):
                 local_direction,
             )
 
-            if hit_location is None or face_index is None:
-                return False
-
-            if not (0 <= face_index < len(bm.faces)):
-                return False
+            if hit_location is None or face_index is None or not (0 <= face_index < len(bm.faces)):
+                # v121: free-space Edit Mode circle.  Keep this completely
+                # separate from the face-cut path.
+                self.edit_free_space = True
+                self.drawing_plane_point, self.drawing_plane_normal = view_fallback_plane(context)
+                return self._finish_plane_basis(
+                    center,
+                    (Vector((1,0,0)), Vector((0,1,0)), Vector((0,0,1))),
+                )
 
             face = bm.faces[face_index]
             self.target_edit_face = face
@@ -321,6 +640,9 @@ class CircleTool(SketchToolBase):
 
     def on_mouse_move(self, context, event):
         if self.state == "READY":
+            # v157: N-panel Circle Segments is a live setting for the next
+            # circle even when the native Circle tool remains active.
+            self._sync_segments_from_scene(context)
             self._snap(context, event)
             self._redraw(context)
             return
@@ -501,17 +823,8 @@ class CircleTool(SketchToolBase):
             return False
 
         n_outer = len(outer_verts)
-        best_anchors = None
-        best_cost = None
         new_quarter_pts = [new_2d[i] for i in new_q]
-        for combo in combinations(range(n_outer), 4):
-            combo = tuple(combo)
-            for shift in range(4):
-                anchors = combo[shift:] + combo[:shift]
-                cost = sum((outer_2d[anchors[i]] - new_quarter_pts[i]).length_squared for i in range(4))
-                if best_cost is None or cost < best_cost:
-                    best_cost = cost
-                    best_anchors = anchors
+        best_anchors = _best_cyclic_boundary_anchors(outer_2d, new_quarter_pts)
         if best_anchors is None:
             return False
 
@@ -721,38 +1034,83 @@ class CircleTool(SketchToolBase):
             inner_positions.reverse()
             inner_2d.reverse()
 
-        # Split the circle into four quarter arcs.  Segment counts that are not
-        # divisible by four are distributed naturally by rounded quarter indices.
+        # v156/v158 containment topology: when the host face itself is a
+        # polygonal circle, preserve both loops and bridge them directly.
+        # Equal segment counts retain the proven 1:1 quad ring.  Unequal counts
+        # use v158 phase-aligned monotone bridging for both centered and
+        # eccentric containment, without adding/resampling boundary vertices.
+        if _looks_like_regular_circle_loop(outer_2d):
+            created_faces = []
+            inner_verts = []
+            original_outer = tuple(outer_verts)
+            try:
+                bmesh.ops.delete(bm, geom=[face], context='FACES_ONLY')
+                inner_verts = [bm.verts.new(position) for position in inner_positions]
+                bm.verts.index_update()
+                inner_face = bm.faces.new(tuple(inner_verts))
+                created_faces.append(inner_face)
+                created_faces.extend(
+                    _bridge_circle_loops(
+                        bm, outer_verts, outer_2d, inner_verts, inner_2d
+                    )
+                )
+
+                for f in bm.faces:
+                    f.select = False
+                if inner_face.is_valid:
+                    inner_face.select = True
+
+                bm.normal_update()
+                bmesh.update_edit_mesh(
+                    obj.data, loop_triangles=True, destructive=True
+                )
+                self._last_edit_error = None
+                debug_print(
+                    "SketchTools Circle: ordered containment ring committed",
+                    "outer_segments=", len(outer_verts),
+                    "inner_segments=", len(inner_verts),
+                    "annulus_faces=", len(created_faces) - 1,
+                )
+                return True
+            except Exception as exc:
+                valid_faces = [f for f in created_faces if f.is_valid]
+                if valid_faces:
+                    bmesh.ops.delete(bm, geom=valid_faces, context='FACES_ONLY')
+                valid_verts = [v for v in inner_verts if v.is_valid]
+                if valid_verts:
+                    bmesh.ops.delete(bm, geom=valid_verts, context='VERTS')
+                try:
+                    if all(v.is_valid for v in original_outer):
+                        bm.faces.new(original_outer)
+                except Exception:
+                    pass
+                bm.normal_update()
+                bmesh.update_edit_mesh(
+                    obj.data, loop_triangles=True, destructive=True
+                )
+                self._last_edit_error = "ordered circle containment failed: " + str(exc)
+                debug_print("SketchTools Circle:", self._last_edit_error)
+                return False
+
+        # Use three sectors for a 3-segment circle (triangle) and the original
+        # four-sector topology for all higher segment counts.  This makes 3 the
+        # true minimum in Edit Mode as it already is in Object Mode.
         n_inner = len(inner_positions)
-        quarter = [
-            0,
-            int(round(n_inner * 0.25)) % n_inner,
-            int(round(n_inner * 0.50)) % n_inner,
-            int(round(n_inner * 0.75)) % n_inner,
+        sector_count = 3 if n_inner == 3 else 4
+        sector_indices = [
+            int(round(n_inner * (i / sector_count))) % n_inner
+            for i in range(sector_count)
         ]
 
-        # Guarantee four distinct ordered indices for very low segment counts.
-        if len(set(quarter)) < 4:
-            self._last_edit_error = "Edit Mode circle cut requires at least 4 segments"
+        if len(set(sector_indices)) < sector_count:
+            self._last_edit_error = f"could not divide {n_inner}-segment circle into ring sectors"
             debug_print("SketchTools Circle Edit commit blocked:", self._last_edit_error)
             return False
 
-        quarter_2d = [inner_2d[i] for i in quarter]
+        sector_2d = [inner_2d[i] for i in sector_indices]
 
         n_outer = len(outer_verts)
-        best_anchors = None
-        best_cost = None
-        for combo in combinations(range(n_outer), 4):
-            combo = tuple(combo)
-            for shift in range(4):
-                anchors = combo[shift:] + combo[:shift]
-                cost = 0.0
-                for i in range(4):
-                    d = outer_2d[anchors[i]] - quarter_2d[i]
-                    cost += d.length_squared
-                if best_cost is None or cost < best_cost:
-                    best_cost = cost
-                    best_anchors = anchors
+        best_anchors = _best_cyclic_boundary_anchors(outer_2d, sector_2d)
 
         if best_anchors is None:
             self._last_edit_error = "could not divide target boundary into four ring sectors"
@@ -796,10 +1154,10 @@ class CircleTool(SketchToolBase):
             inner_face = bm.faces.new(tuple(inner_verts))
             created_faces.append(inner_face)
 
-            for sector in range(4):
-                next_sector = (sector + 1) % 4
-                q0 = quarter[sector]
-                q1 = quarter[next_sector]
+            for sector in range(sector_count):
+                next_sector = (sector + 1) % sector_count
+                q0 = sector_indices[sector]
+                q1 = sector_indices[next_sector]
 
                 arc = inner_arc(q0, q1, inner_verts)
                 chain = outer_chain(
@@ -827,9 +1185,10 @@ class CircleTool(SketchToolBase):
                     ring_face = bm.faces.new(tuple(reversed(clean)))
                 created_faces.append(ring_face)
 
-            if len(created_faces) != 5:
+            expected_faces = 1 + sector_count
+            if len(created_faces) != expected_faces:
                 raise RuntimeError(
-                    f"circle cut must create 1 center + 4 ring faces, got {len(created_faces)}"
+                    f"circle cut must create 1 center + {sector_count} ring faces, got {len(created_faces)}"
                 )
 
             for f in bm.faces:
@@ -849,7 +1208,7 @@ class CircleTool(SketchToolBase):
                 "SketchTools Circle: Edit Mode cut committed successfully",
                 "segments=", n_inner,
                 "target_verts=", len(original_outer),
-                "ring_faces=4",
+                f"ring_faces={sector_count}",
             )
             return True
 
@@ -906,6 +1265,10 @@ class CircleTool(SketchToolBase):
         wm["sketchtools_circle_last_state"] = click_state
 
         if self.state == "READY":
+            # v157: capture the current scene setting at the start of each
+            # circle.  After this click the value is frozen for this circle,
+            # while the following circle may use a different segment count.
+            self._sync_segments_from_scene(context)
             snap = self._snap(context, event)
             ray_origin, ray_direction = get_view_ray(context, event)
             point = None
@@ -934,8 +1297,9 @@ class CircleTool(SketchToolBase):
                                 point = candidate
 
                 if point is None:
-                    self.set_status(context, "Circle: click on a mesh face")
-                    return
+                    fallback_point, fallback_normal = view_fallback_plane(context)
+                    point = mouse_to_plane(context, event, fallback_point, fallback_normal)
+                    self.edit_free_space = True
 
             else:
                 depsgraph = context.evaluated_depsgraph_get()
@@ -945,10 +1309,12 @@ class CircleTool(SketchToolBase):
                     ray_direction,
                 )
 
-                if hit and obj is not None and obj.type == 'MESH':
-                    point = Vector(location)
-                elif snap is not None:
+                if snap is not None:
+                    # Center and Endpoint snaps define the circle center
+                    # exactly; do not let a generic face ray hit override them.
                     point = Vector(snap)
+                elif hit and obj is not None and obj.type == 'MESH':
+                    point = Vector(location)
                 else:
                     fallback_point, fallback_normal = view_fallback_plane(context)
                     point = mouse_to_plane(
@@ -984,25 +1350,37 @@ class CircleTool(SketchToolBase):
                 return
             points = self._circle_points(point)
 
-        if len(points) < 4:
+        if len(points) < 3:
             return
 
         if context.mode == 'EDIT_MESH':
             obj = context.edit_object
-            if obj is None or obj.type != 'MESH':
+            if obj is None or obj.type != 'MESH' or obj.mode != 'EDIT':
                 return
 
-            debug_print("SketchTools Circle: committing second click EDIT_MESH")
-            if self._create_circle_in_edit_face(context, obj, points):
+            debug_print("SketchTools Circle: committing v156 isolated Circle topology EDIT_MESH")
+            # v143: a circle wholly inside the face on which it was started is
+            # a real zero-crossing subdivision.  Use the proven circle ring
+            # cutter for that case so the inner circle and surrounding region
+            # are both faces immediately.  No helper vertices are introduced;
+            # the circle keeps its requested segment count.  Crossing and
+            # free-space circles fall back to the unified planar graph engine.
+            success = False
+            if self.target_edit_face_index is not None or self.target_edit_face_signature is not None:
+                try:
+                    success = self._create_circle_in_edit_face(context, obj, points)
+                except Exception as exc:
+                    debug_print("SketchTools Circle v143 containment fallback:", repr(exc))
+                    success = False
+            if not success:
+                success = insert_circle_planar_boundary_edit(obj, points)
+            if success:
                 self.known_centers.append(self.center.copy())
                 self.reset_operation()
                 self.set_status(context, "Circle: click center | after center X/Y/Z: lock circle plane")
                 self._redraw(context)
             else:
-                self.set_status(
-                    context,
-                    "Circle cut failed: " + (self._last_edit_error or "unknown error")
-                )
+                self.set_status(context, "Circle: could not insert planar boundary")
             return
 
         debug_print("SketchTools Circle: committing second click OBJECT")
@@ -1051,7 +1429,7 @@ class CircleTool(SketchToolBase):
         self.reset_operation()
         self.set_status(
             context,
-            "Circle: click center | type e.g. 48s + Enter to change last circle"
+            "Circle: click center | type radius + Enter | type e.g. 48s + Enter for segments"
         )
         self._redraw(context)
 
@@ -1095,11 +1473,13 @@ class CircleTool(SketchToolBase):
         return True
 
     def on_key_press(self, context, event):
-        """Axis-plane locking while drawing; segment entry while ready."""
+        """Axis-plane locking while drawing; radius/segment entry after creation."""
         if event.type in {'X', 'Y', 'Z'} and self.state == "DRAWING":
             return self._toggle_axis_lock(context, event.type)
 
-        # SketchUp-style post-create segment entry, e.g. 48s + Enter.
+        # SketchUp-style post-create input:
+        #   2m + Enter  -> radius
+        #   48s + Enter -> segment count
         if self.state != "READY" or not self.last_circle_name:
             return False
 
@@ -1111,38 +1491,60 @@ class CircleTool(SketchToolBase):
 
         if event.type in {'BACK_SPACE', 'DEL'}:
             self.segment_input = self.segment_input[:-1]
-            self.set_status(context, "Circle segments: " + (self.segment_input or "_"))
+            typed = self.segment_input or "_"
+            self.set_status(context, "Circle input: " + typed + " | Enter to apply | use s suffix for segments")
+            self.preview.set_measurement_feedback("Circle Input: " + typed)
             return True
 
         if event.type in {'ESC'}:
             self.segment_input = ""
-            self.set_status(context, "Circle: click center | after center X/Y/Z: lock circle plane")
+            self.preview.clear_measurement_feedback()
+            self.set_status(context, "Circle: click center | type radius + Enter | type 48s + Enter for segments")
             return True
 
         if event.type in {'RET', 'NUMPAD_ENTER'}:
             raw = self.segment_input.lower().strip()
-            if raw.endswith("s"):
-                raw = raw[:-1]
 
-            if raw.isdigit():
-                segments = max(3, min(256, int(raw)))
-                if rebuild_parametric_circle(obj, segments):
-                    self.segments = segments
-                    context.scene.sketchtools_circle_segments = segments
-                    debug_print("SketchTools Circle: segments adjusted to", segments)
+            if raw.endswith("s"):
+                segment_text = raw[:-1]
+                if segment_text.isdigit():
+                    segments = max(3, min(256, int(segment_text)))
+                    if rebuild_parametric_circle(obj, segments):
+                        self.segments = segments
+                        context.scene.sketchtools_circle_segments = segments
+                        debug_print("SketchTools Circle: segments adjusted to", segments)
+                        self.segment_input = ""
+                        self.preview.clear_measurement_feedback()
+                        self.set_status(context, f"Circle: {segments} segments | click center")
+                        self._redraw(context)
+                        return True
+            else:
+                radius = parse_length(raw)
+                if radius is not None and resize_parametric_circle(obj, radius):
+                    try:
+                        context.scene.sketchtools_circle_radius = radius
+                    except Exception:
+                        pass
+                    debug_print("SketchTools Circle: radius adjusted to", radius)
                     self.segment_input = ""
-                    self.set_status(context, f"Circle: {segments} segments | click center")
+                    self.preview.set_measurement_feedback("Radius: " + format_length(context, radius))
+                    self.set_status(context, "Circle radius: " + format_length(context, radius) + " | click center")
                     self._redraw(context)
                     return True
 
             self.segment_input = ""
-            self.set_status(context, "Circle: invalid segment count")
+            self.preview.clear_measurement_feedback()
+            self.set_status(context, "Circle: invalid input | radius e.g. 2m, segments e.g. 48s")
             return True
 
         ch = getattr(event, "unicode", "")
-        if ch and (ch.isdigit() or ch.lower() == "s"):
+        if ch and (ch.isdigit() or ch.lower() in '.mcftink"s'):
             self.segment_input += ch.lower()
-            self.set_status(context, "Circle segments: " + self.segment_input)
+            self.set_status(
+                context,
+                "Circle input: " + self.segment_input + " | Enter to apply | s suffix = segments"
+            )
+            self.preview.set_measurement_feedback("Circle Input: " + self.segment_input)
             return True
 
         return False
@@ -1184,4 +1586,5 @@ class CircleTool(SketchToolBase):
         self._base_plane_normal = None
         self._base_axis_u = None
         self._base_axis_v = None
+        self.edit_free_space = False
         self.preview.clear()

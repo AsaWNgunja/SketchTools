@@ -28,6 +28,8 @@ from ..utils.geometry_object import get_or_create_geometry_object
 from ..utils.cursor import restore_cursor
 from ..utils.measurements import format_length
 from ..utils.axis_lock import PLANE_LABELS, set_world_axis_plane
+from ..geometry.edit_free_geometry import create_disconnected_face
+from ..geometry.topology import insert_closed_planar_boundary_edit
 
 
 class RectanglePreview(SnapFeedbackMixin):
@@ -97,6 +99,7 @@ class RectangleTool(SketchToolBase):
         self._base_plane_normal = None
         self._base_axis_u = None
         self._base_axis_v = None
+        self.edit_free_space = False
 
     def start(self, context):
         super().start(context)
@@ -119,12 +122,14 @@ class RectangleTool(SketchToolBase):
             extra_centers=None,
             inference_origin=(self.start_point if self.start_point is not None else None),
             include_face=True,
-            include_grid=(context.mode != 'EDIT_MESH'),
+            include_grid=True,
             preferred_axis=(
                 self._last_snap_type
                 if self._last_snap_type in {"X_AXIS", "Y_AXIS", "Z_AXIS"}
                 else None
             ),
+            previous_snap_type=self._last_snap_type,
+            snap_hysteresis_pixels=7,
         )
         if snap is not None and snap.valid:
             self._last_snap_type = snap.snap_type
@@ -228,6 +233,15 @@ class RectangleTool(SketchToolBase):
                             candidates,
                         )
 
+            # v121: no active edit face under the cursor -> safe free-space
+            # construction plane.  This path never enters the face cutter.
+            self.edit_free_space = True
+            self.drawing_plane_point, self.drawing_plane_normal = view_fallback_plane(context)
+            return self._finish_plane_basis(
+                point,
+                (Vector((1, 0, 0)), Vector((0, 1, 0)), Vector((0, 0, 1))),
+            )
+
         depsgraph = context.evaluated_depsgraph_get()
 
         hit, location, normal, face_index, obj, matrix = (
@@ -304,13 +318,11 @@ class RectangleTool(SketchToolBase):
             .normalized()
         )
 
-        delta = Vector(point) - self.drawing_plane_point
-
-        self.start_point = (
-            Vector(point)
-            - self.drawing_plane_normal
-            * delta.dot(self.drawing_plane_normal)
-        )
+        # The acquired snap coordinate is authoritative.  Anchor the
+        # construction plane through it instead of re-projecting it onto the
+        # ray-hit plane.  This keeps Endpoint/Edge starts exact in 3D space.
+        self.drawing_plane_point = Vector(point).copy()
+        self.start_point = Vector(point).copy()
 
         return True
 
@@ -714,15 +726,12 @@ class RectangleTool(SketchToolBase):
                             if abs((candidate - hit_world).dot(hit_world_normal)) <= 1e-4:
                                 point = candidate
 
-                # Edit Mode rectangles are face-cutting operations.  Do not
-                # silently fall back to the world XY plane when no edit face
-                # is under the cursor.
+                # v121: if the active edit mesh is missed, draw a disconnected
+                # island on the standard SketchTools fallback plane.
                 if point is None:
-                    self.set_status(
-                        context,
-                        "Rectangle: click on a mesh face",
-                    )
-                    return
+                    fallback_point, fallback_normal = view_fallback_plane(context)
+                    point = mouse_to_plane(context, event, fallback_point, fallback_normal)
+                    self.edit_free_space = True
 
             else:
                 # Object Mode can use Blender's evaluated scene ray cast.
@@ -733,10 +742,13 @@ class RectangleTool(SketchToolBase):
                     ray_direction,
                 )
 
-                if hit and obj is not None and obj.type == 'MESH':
-                    point = Vector(location)
-                elif snap is not None:
+                if snap is not None:
+                    # A visible geometry snap (Endpoint/Center/Midpoint/Edge)
+                    # must be the actual first corner, not merely a label while
+                    # the scene ray hit wins underneath it.
                     point = Vector(snap)
+                elif hit and obj is not None and obj.type == 'MESH':
+                    point = Vector(location)
                 else:
                     fallback_point, fallback_normal = view_fallback_plane(context)
                     point = mouse_to_plane(
@@ -788,23 +800,29 @@ class RectangleTool(SketchToolBase):
 
         if context.mode == 'EDIT_MESH':
             obj = context.edit_object or context.active_object
-
             if obj is None or obj.type != 'MESH' or obj.mode != 'EDIT':
                 self._last_edit_error = "no active mesh edit object at commit"
                 self.set_status(context, "Rectangle: " + self._last_edit_error)
-                debug_print("SketchTools Rectangle Edit commit blocked:", self._last_edit_error)
                 return
 
-            if not self._create_rectangle_in_edit_face(
-                context,
-                obj,
-                points,
-            ):
-                self.set_status(
-                    context,
-                    "Rectangle: " + (self._last_edit_error or "could not cut face"),
-                )
-                return
+            # v143: containment is a zero-crossing intersection.  When the
+            # rectangle starts on, and remains fully inside, one existing face,
+            # use the proven clean ring cutter first.  It creates the centre
+            # rectangle plus surrounding ring faces without adding vertices
+            # beyond the four rectangle corners.  Crossing/partial-overlap and
+            # free-space cases continue through the unified planar engine.
+            contained_cut = False
+            if self.target_edit_face_index is not None or self.target_edit_face_signature is not None:
+                try:
+                    contained_cut = self._create_rectangle_in_edit_face(context, obj, points)
+                except Exception as exc:
+                    debug_print("SketchTools Rectangle v143 containment fallback:", repr(exc))
+                    contained_cut = False
+
+            if not contained_cut:
+                if not insert_closed_planar_boundary_edit(obj, points):
+                    self.set_status(context, "Rectangle: could not insert planar boundary")
+                    return
 
         else:
             # Object Mode: every rectangle is its own mesh object.
@@ -941,4 +959,5 @@ class RectangleTool(SketchToolBase):
         self._base_plane_normal = None
         self._base_axis_u = None
         self._base_axis_v = None
+        self.edit_free_space = False
         self.preview.clear()

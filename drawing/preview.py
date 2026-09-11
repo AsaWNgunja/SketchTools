@@ -13,6 +13,11 @@ class PreviewLine(SnapFeedbackMixin):
 
         self.snap_point = None
 
+        # v163: committed preview chain for transactional Line-on-face drawing.
+        # These points are display-only; host mesh topology is not touched until
+        # the polygon closes.
+        self.chain_points = []
+
         # v94 equal-length inference guide.  These are world-space points so
         # the guide remains anchored correctly while the view changes.
         self.equal_reference_start = None
@@ -37,6 +42,10 @@ class PreviewLine(SnapFeedbackMixin):
 
         self.start = start
         self.end = end
+
+
+    def set_chain_points(self, points):
+        self.chain_points = [p.copy() for p in points] if points else []
 
 
     def set_snap_point(
@@ -106,6 +115,25 @@ class PreviewLine(SnapFeedbackMixin):
             }
             shader.uniform_float("color", axis_colors[self.axis_guide_type])
             axis_batch.draw(shader)
+            gpu.state.line_width_set(1.0)
+
+        # ---------------------------------
+        # v163 transactional committed chain
+        # ---------------------------------
+
+        if len(self.chain_points) >= 2:
+            positions = []
+            for i in range(len(self.chain_points) - 1):
+                positions.extend((self.chain_points[i], self.chain_points[i + 1]))
+            chain_batch = batch_for_shader(
+                shader,
+                "LINES",
+                {"pos": positions},
+            )
+            gpu.state.line_width_set(3.0)
+            shader.bind()
+            shader.uniform_float("color", (1.0, 1.0, 0.0, 1.0))
+            chain_batch.draw(shader)
             gpu.state.line_width_set(1.0)
 
         # ---------------------------------
@@ -225,8 +253,14 @@ class PreviewLine(SnapFeedbackMixin):
 
     def clear(self):
 
+        # v126: clear every transient Line preview primitive.  v125 reset the
+        # LineTool inference fields, but PreviewLine still retained the actual
+        # world-space guide coordinates, so re-selecting Line drew them again.
         self.start = None
         self.end = None
         self.snap_point = None
+        self.chain_points = []
+        self.clear_axis_guide()
+        self.clear_equal_length_guide()
         self.clear_snap_feedback()
         self.clear_measurement_feedback()

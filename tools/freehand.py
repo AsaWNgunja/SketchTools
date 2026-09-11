@@ -24,7 +24,8 @@ from ..geometry.snapping import (
     snap_label,
 )
 from ..utils.cursor import restore_cursor
-from ..geometry.topology import _autocut_edge_bmesh
+from ..geometry.topology import _autocut_edge_bmesh, _retopologize_edit_planar_region, _edges_on_segment
+from ..geometry.edit_free_geometry import create_disconnected_chain, create_disconnected_face
 
 
 class FreehandPreview(SnapFeedbackMixin):
@@ -95,11 +96,12 @@ class FreehandTool(SketchToolBase):
         self.target_edit_object_name = None
         self.closed_loop = False
         self._last_snap_type = None
+        self.edit_free_space = False
 
     def start(self, context):
         super().start(context)
         self.reset_stroke()
-        self.set_status(context, "Freehand: hold Left Mouse and drag")
+        self.set_status(context, "Freehand: click to start; move freely")
         debug_print("Freehand Tool Active")
 
     def _redraw(self, context):
@@ -140,6 +142,56 @@ class FreehandTool(SketchToolBase):
         )
         return point
 
+    def _release_close_point(self, context, event, candidate=None):
+        """Return the exact first point when a stroke is released near it.
+
+        v166: closure must not depend on the last sampled mouse-move landing
+        exactly on the first point.  Freehand is sampled at ``spacing_px``
+        intervals, so a fast final motion can otherwise release inside the
+        visual Close Loop marker without ever appending that snapped sample.
+        Use screen-space proximity as the authority and always reuse the exact
+        first vertex.  A small geometry fallback covers projection edge cases.
+        """
+        if self.state != "DRAWING" or len(self.points) < 3:
+            return None
+
+        first = Vector(self.points[0]).copy()
+        threshold_px = max(18.0, min(28.0, float(self.spacing_px) * 3.0))
+
+        region = context.region
+        rv3d = context.region_data
+        if region is not None and rv3d is not None:
+            try:
+                screen = view3d_utils.location_3d_to_region_2d(region, rv3d, first)
+            except Exception:
+                screen = None
+            if screen is not None:
+                dx = float(event.mouse_region_x) - float(screen.x)
+                dy = float(event.mouse_region_y) - float(screen.y)
+                if (dx * dx + dy * dy) ** 0.5 <= threshold_px:
+                    self.preview.set_snap_point(first)
+                    self.preview.set_snap_feedback(
+                        "Close Loop", event.mouse_region_x, event.mouse_region_y
+                    )
+                    return first
+
+        # Defensive world-space fallback.  Keep it scale-aware and deliberately
+        # tight so an open stroke cannot accidentally close across the shape.
+        if candidate is not None:
+            try:
+                cand = Vector(candidate)
+                pts = [Vector(p) for p in self.points]
+                lo = Vector((min(p.x for p in pts), min(p.y for p in pts), min(p.z for p in pts)))
+                hi = Vector((max(p.x for p in pts), max(p.y for p in pts), max(p.z for p in pts)))
+                diag = (hi - lo).length
+                tol = max(1e-5, min(diag * 0.025, 0.05))
+                if (cand - first).length <= tol:
+                    return first
+            except Exception:
+                pass
+
+        return None
+
     def _snap(self, context, event):
         start_snap = self._start_point_snap(context, event)
         if start_snap is not None:
@@ -154,12 +206,22 @@ class FreehandTool(SketchToolBase):
             extra_centers=None,
             inference_origin=(self.points[-1] if self.state == 'DRAWING' and self.points else None),
             include_face=True,
-            include_grid=(context.mode != 'EDIT_MESH'),
+            include_grid=True,
             preferred_axis=(
                 self._last_snap_type
                 if self._last_snap_type in {"X_AXIS", "Y_AXIS", "Z_AXIS"}
                 else None
             ),
+            # v169: Freehand needs a generous acquisition zone because the
+            # cursor is normally moving continuously rather than being placed
+            # carefully like Line.  Endpoint remains higher priority than Edge
+            # inside resolve_snap().
+            endpoint_pixel_radius=30,
+            edge_pixel_radius=24,
+            midpoint_pixel_radius=22,
+            center_pixel_radius=22,
+            previous_snap_type=self._last_snap_type,
+            snap_hysteresis_pixels=7,
         )
         if snap is not None and snap.valid:
             self._last_snap_type = snap.snap_type
@@ -213,8 +275,15 @@ class FreehandTool(SketchToolBase):
             )
 
             if surface_point is None:
-                return None
+                # v121: free-space Edit Mode stroke.  Use the same fallback
+                # construction plane as Object Mode but commit directly into
+                # the active edit BMesh as a disconnected island.
+                self.drawing_plane_point, self.drawing_plane_normal = view_fallback_plane(context)
+                self.target_edit_object_name = context.edit_object.name if context.edit_object else None
+                self.edit_free_space = True
+                return mouse_to_plane(context, event, self.drawing_plane_point, self.drawing_plane_normal)
 
+            self.edit_free_space = False
             # Establish the hovered surface FIRST.  Only then resolve snaps,
             # so geometry/grid behind the face can never steal the stroke.
             self.drawing_plane_point = Vector(surface_point)
@@ -263,9 +332,18 @@ class FreehandTool(SketchToolBase):
         Close Loop remains the highest-priority intentional snap.
         """
         if context.mode == 'EDIT_MESH' and self.state == "DRAWING":
-            close_point = self._start_point_snap(context, event)
-            if close_point is not None:
-                return Vector(close_point)
+            if self.edit_free_space:
+                close_point = self._start_point_snap(context, event)
+                if close_point is not None:
+                    return Vector(close_point)
+                return mouse_to_plane(context, event, self.drawing_plane_point, self.drawing_plane_normal)
+
+            # v169: continuously acquire real topology before the broad On Face
+            # raycast.  This makes Endpoint/Edge visible and exact while the
+            # freehand preview approaches its intended termination target.
+            terminal_point, terminal_type = self._terminal_snap(context, event)
+            if terminal_point is not None:
+                return Vector(terminal_point)
 
             surface_point, surface_normal, obj = self._raycast_edit_surface(
                 context,
@@ -309,9 +387,10 @@ class FreehandTool(SketchToolBase):
         # every sample to grids/edges. This removes staircase artifacts and also
         # prevents background geometry from pulling the stroke through a face.
         if self.state == "DRAWING":
-            close_point = self._start_point_snap(context, event)
-            if close_point is not None:
-                return Vector(close_point)
+            # v169: same strong topology acquisition in Object Mode.
+            terminal_point, terminal_type = self._terminal_snap(context, event)
+            if terminal_point is not None:
+                return Vector(terminal_point)
 
             ray_origin, ray_direction = get_view_ray(context, event)
             try:
@@ -467,33 +546,109 @@ class FreehandTool(SketchToolBase):
     def _update_preview_points(self):
         self.preview.set_points(self._display_points())
 
+    def _terminal_snap(self, context, event):
+        """Return a topology endpoint that is allowed to finish Freehand.
+
+        v167 deliberately excludes Face/Grid/Midpoint/Center/Origin: clicking
+        empty space or ordinary face space must keep the same freehand stroke
+        alive. Only the stroke start, an existing mesh endpoint, or an existing
+        mesh edge can terminate it.
+        """
+        close = self._start_point_snap(context, event, threshold_px=28.0)
+        if close is not None:
+            return Vector(close), "CLOSE"
+
+        snap = resolve_snap(
+            context,
+            event.mouse_region_x,
+            event.mouse_region_y,
+            plane_point=self.drawing_plane_point,
+            plane_normal=self.drawing_plane_normal,
+            extra_centers=None,
+            inference_origin=None,
+            include_face=False,
+            include_grid=False,
+            include_axis_grid=False,
+            allow_off_plane_geometry=False,
+            endpoint_pixel_radius=30,
+            edge_pixel_radius=20,
+        )
+        if snap is not None and snap.valid and snap.snap_type in {"ENDPOINT", "EDGE"}:
+            self.preview.set_snap_point(snap.location)
+            self.preview.set_snap_feedback(
+                snap_label(snap), event.mouse_region_x, event.mouse_region_y
+            )
+            return Vector(snap.location), snap.snap_type
+        return None, None
+
+    def _commit_active_stroke(self, context):
+        if len(self.points) < 2:
+            return False
+        if context.mode == 'EDIT_MESH':
+            self._commit_edit_mode(context)
+        else:
+            self._commit_object_mode(context)
+        self.reset_stroke()
+        self.set_status(context, "Freehand: click to start; move freely")
+        self._redraw(context)
+        return True
+
     def on_left_click(self, context, event):
         if context.mode not in {'OBJECT', 'EDIT_MESH'}:
+            self.set_status(context, "Freehand supports Object Mode and Mesh Edit Mode")
+            return
+
+        # First click starts a persistent freehand stroke. LMB does not need to
+        # remain held after this point.
+        if self.state == "READY":
+            point = self._first_point_and_plane(context, event)
+            if point is None:
+                if context.mode == 'EDIT_MESH':
+                    self.set_status(context, "Freehand: start on a mesh face")
+                return
+            self.points = [Vector(point).copy()]
+            self._update_preview_points()
+            self.last_mouse_x = event.mouse_region_x
+            self.last_mouse_y = event.mouse_region_y
+            self.state = "DRAWING"
             self.set_status(
                 context,
-                "Freehand supports Object Mode and Mesh Edit Mode",
+                "Freehand: move to draw; reach a vertex/edge to finish",
             )
+            self._redraw(context)
             return
 
-        if self.state != "READY":
+        if self.state != "DRAWING":
             return
 
-        point = self._first_point_and_plane(context, event)
-        if point is None:
-            if context.mode == 'EDIT_MESH':
-                self.set_status(context, "Freehand: start on a mesh face")
+        # Subsequent clicks are anchors unless they land on valid topology.
+        # This permits any number of click/move sections in one continuous
+        # freehand stroke.
+        terminal, terminal_type = self._terminal_snap(context, event)
+        if terminal is not None:
+            terminal = Vector(terminal)
+            if terminal_type == "CLOSE":
+                self.closed_loop = True
+                terminal = Vector(self.points[0]).copy()
+            if not self.points or (terminal - self.points[-1]).length > 1e-6:
+                self.points.append(terminal)
+            elif terminal_type == "CLOSE" and (self.points[-1] - self.points[0]).length > 1e-6:
+                self.points.append(Vector(self.points[0]).copy())
+            self._update_preview_points()
+            self._commit_active_stroke(context)
             return
 
-        self.points = [Vector(point).copy()]
-        self._update_preview_points()
-        self.last_mouse_x = event.mouse_region_x
-        self.last_mouse_y = event.mouse_region_y
-        self.state = "DRAWING"
-
-        self.set_status(
-            context,
-            "Freehand: drag, release Left Mouse to finish",
-        )
+        # Not on a vertex/edge: record the current free-space/surface point as
+        # another anchor and continue drawing; do NOT finish.
+        point = self._event_point(context, event)
+        if point is not None:
+            point = Vector(point)
+            if not self.points or (point - self.points[-1]).length > 1e-6:
+                self.points.append(point)
+                self._update_preview_points()
+            self.last_mouse_x = event.mouse_region_x
+            self.last_mouse_y = event.mouse_region_y
+        self.set_status(context, "Freehand: continuing; reach a vertex/edge to finish")
         self._redraw(context)
 
     def on_mouse_move(self, context, event):
@@ -532,43 +687,9 @@ class FreehandTool(SketchToolBase):
         self._redraw(context)
 
     def on_left_release(self, context, event):
-        if self.state != "DRAWING":
-            return
-
-        point = self._event_point(context, event)
-        if point is not None:
-            point = Vector(point)
-
-            # If release occurs on the first point, close exactly to the
-            # original vertex rather than leaving a tiny gap or a duplicate.
-            if (
-                len(self.points) >= 3
-                and (point - self.points[0]).length < 1e-6
-            ):
-                self.closed_loop = True
-                if (self.points[-1] - self.points[0]).length > 1e-6:
-                    self.points.append(Vector(self.points[0]).copy())
-            elif not self.points or (point - self.points[-1]).length > 1e-6:
-                self.points.append(point)
-
-        if len(self.points) < 2:
-            self.reset_stroke()
-            self.set_status(context, "Freehand: hold Left Mouse and drag")
-            self._redraw(context)
-            return
-
-        if context.mode == 'EDIT_MESH':
-            # v66: keep the raw stroke until _commit_edit_mode prepares one
-            # authoritative simplified/smoothed path for every topology route.
-            self._commit_edit_mode(context)
-        else:
-            # Object Mode keeps the raw stroke until commit so dense mouse
-            # samples can be reduced before the final smoothing pass.
-            self._commit_object_mode(context)
-
-        self.reset_stroke()
-        self.set_status(context, "Freehand: hold Left Mouse and drag")
-        self._redraw(context)
+        # v167: releasing LMB never finishes Freehand. Drawing continues from
+        # mouse movement until an explicit topology termination click.
+        return
 
     def _object_simplify_epsilon(self, points):
         """
@@ -655,10 +776,16 @@ class FreehandTool(SketchToolBase):
             edges.append((len(local_points) - 1, 0))
 
         mesh = bpy.data.meshes.new("Freehand")
+        faces = []
+        if closed and len(local_points) >= 3:
+            # v166: a closed Freehand stroke is real closed geometry, not only
+            # a cyclic wire.  Object Mode mirrors Line/Rectangle/Circle by
+            # creating an independent filled object immediately.
+            faces = [tuple(range(len(local_points)))]
         mesh.from_pydata(
             [tuple(p) for p in local_points],
             edges,
-            [],
+            faces,
         )
         mesh.update()
 
@@ -678,6 +805,8 @@ class FreehandTool(SketchToolBase):
         debug_print(
             "SketchTools Freehand: stroke created in Object Mode",
             "points=", len(points),
+            "closed=", closed,
+            "face=", bool(faces),
         )
 
     def _point_segment_distance(self, point, a, b):
@@ -1233,21 +1362,25 @@ class FreehandTool(SketchToolBase):
                 debug_print("SketchTools Freehand: Edit Mode target object changed")
                 return False
 
+            # v121 free-space strokes never enter Knife/cut/autocut code.
+            if self.edit_free_space:
+                is_closed = len(final_points) >= 4 and (Vector(final_points[0]) - Vector(final_points[-1])).length < 1e-6
+                if is_closed:
+                    return create_disconnected_face(context, final_points)
+                return create_disconnected_chain(context, final_points, closed=False)
+
             # Closed loops wholly inside a planar face need an explicit face-with-
             # hole rebuild; a wire chain alone cannot split that face in BMesh.
             if self._closed_loop_face_cut(context):
                 return True
 
-            # Open/cross-boundary strokes can still use Knife Project first.
-            if self._knife_project_edit_mode(context):
-                debug_print(
-                    "SketchTools Freehand: Knife Project topology cut",
-                    "sampled_points=", len(final_points),
-                    "closed=", self.closed_loop,
-                )
-                return True
-
-            # Fallback for contexts where Knife Project cannot run.
+            # v173: use the same topology-aware segment insertion as Line as the
+            # PRIMARY path for open / cross-boundary Freehand strokes. Knife
+            # Project could succeed visually while leaving crossed mesh edges
+            # unsplit or creating unnecessary local cells. _autocut_edge_bmesh
+            # gives every intermediate Freehand segment a true intersection
+            # vertex, then one planar rebuild at transaction completion produces
+            # only the real bounded cells.
             bm = bmesh.from_edit_mesh(obj.data)
             inv = obj.matrix_world.inverted()
 
@@ -1264,6 +1397,28 @@ class FreehandTool(SketchToolBase):
                 if _autocut_edge_bmesh(bm, p1, p2):
                     created_segments += 1
 
+            # v168: an open curved chain from one host boundary point to another
+            # can leave intermediate Freehand vertices as wire geometry because
+            # connect_vert_pair only splits a face when both vertices already
+            # belong to that face boundary.  Once the complete chain is present,
+            # rebuild the affected coplanar graph into its true bounded cells.
+            # This is the same proven planar-cell engine used by Line, applied
+            # only at Freehand transaction completion.
+            stroke_edges = []
+            for p1, p2 in zip(local_points, local_points[1:]):
+                stroke_edges.extend(_edges_on_segment(bm, p1, p2))
+            # Preserve order while removing duplicate BMesh edge references.
+            stroke_edges = list(dict.fromkeys(e for e in stroke_edges if e is not None and e.is_valid))
+            rebuilt_faces = _retopologize_edit_planar_region(bm, stroke_edges) if stroke_edges else 0
+
+            # If the local graph engine could not insert anything, keep the old
+            # Knife Project route only as a last-resort compatibility fallback.
+            if created_segments == 0 and rebuilt_faces == 0:
+                bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+                if self._knife_project_edit_mode(context):
+                    debug_print("SketchTools Freehand: Knife Project last-resort fallback")
+                    return True
+
             bm.verts.index_update()
             bm.edges.index_update()
             bm.faces.index_update()
@@ -1278,6 +1433,7 @@ class FreehandTool(SketchToolBase):
                 "SketchTools Freehand: topology cut in Edit Mode",
                 "segments=", created_segments,
                 "sampled_points=", len(local_points),
+                "rebuilt_faces=", rebuilt_faces,
                 "closed=", bool(
                     len(local_points) >= 4
                     and (local_points[0] - local_points[-1]).length < 1e-6
@@ -1290,7 +1446,7 @@ class FreehandTool(SketchToolBase):
     def on_right_click(self, context, event):
         if self.state == "DRAWING":
             self.reset_stroke()
-            self.set_status(context, "Freehand: hold Left Mouse and drag")
+            self.set_status(context, "Freehand: click to start; move freely")
             self._redraw(context)
             debug_print("Freehand stroke cancelled")
         else:
@@ -1320,3 +1476,4 @@ class FreehandTool(SketchToolBase):
         self.target_edit_object_name = None
         self.closed_loop = False
         self._last_snap_type = None
+        self.edit_free_space = False

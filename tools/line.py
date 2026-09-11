@@ -12,11 +12,13 @@ from ..geometry.raycast import (
 )
 
 from ..geometry.snapping import resolve_snap, snap_label, SnapResult, _result_is_occluded
-from ..geometry.projection import object_or_floor_plane
+from ..geometry.projection import object_or_floor_plane, view_fallback_plane
+from ..geometry.edit_free_geometry import intersect_face_at_points
 
 from ..geometry.topology import (
     create_edge,
-    create_face_from_points
+    create_face_from_points,
+    _autocut_edge_bmesh,
 )
 from ..core.session import tool_manager
 from ..drawing.preview import PreviewLine
@@ -27,9 +29,6 @@ from ..utils.cursor import (
     restore_cursor
 )
 
-from ..utils.geometry_object import (
-    get_or_create_geometry_object
-)
 from ..utils.measurements import format_length, parse_length
 from ..utils.axis_lock import (
     axis_vector,
@@ -39,6 +38,18 @@ from ..utils.axis_lock import (
 
 from ..core.tool_base import SketchToolBase
 
+def _create_object_mode_line_object(context):
+    """Create a fresh Object-Mode Line mesh for the current drawing chain.
+
+    v130 rule: Object Mode never appends a newly drawn polygon to an existing
+    SketchTools or arbitrary active mesh.  A completed closed polygon therefore
+    remains an independent Blender object.
+    """
+    mesh = bpy.data.meshes.new("SketchTools Line Mesh")
+    obj = bpy.data.objects.new("SketchTools Line", mesh)
+    collection = getattr(context, "collection", None) or context.scene.collection
+    collection.objects.link(obj)
+    return obj
 
 
 class LineTool(SketchToolBase):
@@ -52,6 +63,8 @@ class LineTool(SketchToolBase):
         self.drawing_plane_point = None
         self.drawing_plane_normal = None
         self._last_snap_type = None
+        self._last_snap_result = None
+        self._last_axis_direction = None
 
         self.state = "READY"
         
@@ -70,6 +83,10 @@ class LineTool(SketchToolBase):
         # Explicit world-axis lock.  X/Y/Z toggles the current segment onto
         # that axis through start_point; pressing the same key again unlocks.
         self.axis_lock = None
+        self.edit_free_space = False
+        # v163: when a chain starts on an Edit-Mode face, keep the host mesh
+        # completely unchanged until the loop closes.
+        self.defer_host_face_topology = False
 
 
     # -------------------------------------
@@ -127,7 +144,13 @@ class LineTool(SketchToolBase):
         return point
 
     def _preferred_axis(self):
-        """Return the X/Y/Z inference family retained by the last line snap."""
+        """Return the directed automatic inference retained by the last snap.
+
+        v109 remembers +X/-X/+Y/-Y/+Z/-Z separately. This prevents the
+        opposite ray of the same axis from inheriting hysteresis.
+        """
+        if self._last_axis_direction is not None:
+            return self._last_axis_direction
         return {
             "X_AXIS": "X_AXIS",
             "Y_AXIS": "Y_AXIS",
@@ -198,10 +221,12 @@ class LineTool(SketchToolBase):
             plane_normal=self.drawing_plane_normal,
             inference_origin=(self.start_point if self.state == 'DRAWING' else None),
             include_face=True,
-            include_grid=(context.mode != 'EDIT_MESH'),
+            include_grid=True,
+            # v108: automatic XYZ inference uses screen-projected world axes
+            # in Perspective for both Object and Edit Mode. Manual axis locks
+            # remain authoritative in _locked_axis_point().
             world_axis_inference=(
-                context.mode != 'EDIT_MESH'
-                and context.region_data is not None
+                context.region_data is not None
                 and context.region_data.view_perspective == 'PERSP'
             ),
             preferred_axis=self._preferred_axis(),
@@ -209,9 +234,29 @@ class LineTool(SketchToolBase):
             # crossings that lie on the same inferred X/Y/Z ray. Other tools
             # retain v94 snapping unchanged.
             include_axis_grid=(self.state == 'DRAWING'),
+            # Object Mode Line is a true 3D construction tool.  Once an
+            # Endpoint/Midpoint/Edge/Center is acquired, preserve that exact
+            # world coordinate even when it is not on the fallback plane.
+            allow_off_plane_geometry=(context.mode != 'EDIT_MESH'),
+            endpoint_pixel_radius=26 if context.mode == 'EDIT_MESH' else 20,
+            # v170: Line boundary acquisition is intentionally stronger than
+            # ordinary hover snapping. A chain that is crossing an existing
+            # face must reliably catch the boundary so the click can terminate
+            # and cut the host cell SketchUp-style. Endpoint still outranks Edge
+            # in resolve_snap(), so corners remain exact rather than sticky-edge.
+            edge_pixel_radius=24 if context.mode == 'EDIT_MESH' else 20,
+            midpoint_pixel_radius=22,
+            center_pixel_radius=22,
+            previous_snap_type=self._last_snap_type,
+            snap_hysteresis_pixels=7,
         )
         if snap is not None and snap.valid:
+            self._last_snap_result = snap
             self._last_snap_type = snap.snap_type
+            if snap.snap_type in {"X_AXIS", "Y_AXIS", "Z_AXIS", "X_GRID", "Y_GRID", "Z_GRID"}:
+                self._last_axis_direction = getattr(snap, "axis_direction", None)
+            else:
+                self._last_axis_direction = None
             self.preview.set_snap_point(snap.location)
             self.preview.set_snap_feedback(
                 snap_label(snap), event.mouse_region_x, event.mouse_region_y
@@ -219,6 +264,7 @@ class LineTool(SketchToolBase):
             return Vector(snap.location)
         # Keep the previous axis inference as short-lived hysteresis memory.
         # It will be replaced as soon as another valid snap is acquired.
+        self._last_snap_result = None
         self.preview.clear_snap_point()
         self.preview.clear_snap_feedback()
         return None
@@ -368,47 +414,72 @@ class LineTool(SketchToolBase):
         n_outer = len(outer)
         n_inner = len(inner_pos)
 
-        # Map the outer boundary onto the new inner polygon in cyclic order.
-        # The original cutter required n_inner >= n_outer, so a second smaller
-        # polygon inside the first centre face could never cut. Keep the old
-        # distinct-anchor solution when possible; otherwise use an ordered
-        # perimeter mapping that permits repeated inner anchors.
+        # v177 sparse Line-host sectors: a contained Line polygon must not
+        # create one bridge for every polygon vertex.  Use at most FOUR
+        # principal host connections (fewer when either loop has <4 vertices).
+        # The inner boundary between those anchors is absorbed into the broad
+        # surrounding sectors.  This gives Z-shaped polygons the requested
+        # minimal 1/2/3/4 boundary connections instead of a radial fan.
+        if n_outer < 3 or n_inner < 3:
+            return False
+
+        bridge_count = min(4, n_outer, n_inner)
+
+        def _forward_outer_chain(start_idx, end_idx):
+            chain = [outer[start_idx]]
+            idx = start_idx
+            safety = 0
+            while idx != end_idx:
+                idx = (idx + 1) % n_outer
+                chain.append(outer[idx])
+                safety += 1
+                if safety > n_outer:
+                    raise RuntimeError("invalid Line outer chain")
+            return chain
+
+        # Pick bridge_count inner anchors around the polygon perimeter.  Search
+        # cyclic phases so the four anchors naturally land on representative
+        # extremities/corners rather than being tied to the first-click phase.
         best = None
         best_cost = None
-
-        if n_inner >= n_outer:
-            for combo in combinations(range(n_inner), n_outer):
-                combo = tuple(combo)
-                for shift in range(n_outer):
-                    anchors = combo[shift:] + combo[:shift]
-                    cost = 0.0
-                    for i in range(n_outer):
-                        d = outer2[i] - inner2[anchors[i]]
-                        cost += d.length_squared
-                    if best_cost is None or cost < best_cost:
-                        best_cost = cost
-                        best = anchors
-        else:
-            # Ordered cyclic mapping. Repeated anchors create valid triangular
-            # sectors where necessary, while the full inner loop is traversed
-            # exactly once around the annulus.
-            for shift in range(n_inner):
+        best_inner_ids = None
+        for inner_shift in range(n_inner):
+            inner_ids = tuple(
+                (inner_shift + int(round(k * n_inner / bridge_count))) % n_inner
+                for k in range(bridge_count)
+            )
+            if len(set(inner_ids)) != bridge_count:
+                continue
+            for outer_shift in range(n_outer):
                 anchors = tuple(
-                    (shift + int(round(i * n_inner / n_outer))) % n_inner
-                    for i in range(n_outer)
+                    (outer_shift + int(round(k * n_outer / bridge_count))) % n_outer
+                    for k in range(bridge_count)
                 )
+                if len(set(anchors)) != bridge_count:
+                    continue
                 cost = sum(
-                    (outer2[i] - inner2[anchors[i]]).length_squared
-                    for i in range(n_outer)
+                    (outer2[anchors[k]] - inner2[inner_ids[k]]).length_squared
+                    for k in range(bridge_count)
                 )
                 if best_cost is None or cost < best_cost:
                     best_cost = cost
                     best = anchors
+                    best_inner_ids = inner_ids
 
-        if best is None:
+        if best is None or best_inner_ids is None:
             return False
 
-        inner_verts = [bm.verts.new(p) for p in inner_pos]
+        # v161: reuse the Line vertices already inserted by the open chain.
+        # Creating a second coincident vertex ring here would leave stacked
+        # topology on the host face and make later edits unreliable.
+        inner_verts = []
+        for p in inner_pos:
+            existing = None
+            for vert in bm.verts:
+                if vert.is_valid and (vert.co - p).length < 1e-5:
+                    existing = vert
+                    break
+            inner_verts.append(existing if existing is not None else bm.verts.new(p))
         bm.verts.index_update()
 
         def inner_chain(start_idx, end_idx):
@@ -429,15 +500,21 @@ class LineTool(SketchToolBase):
         created = []
 
         try:
-            # Prepare all ring loops before destructive mutation.
+            # Exactly bridge_count annular sectors.  Each sector follows the
+            # host boundary forward, then follows the corresponding portion of
+            # the inner polygon backward.  Intermediate inner vertices remain
+            # genuine Z-boundary vertices without receiving helper bridges.
             ring_loops = []
-            for i in range(n_outer):
-                j = (i + 1) % n_outer
-                chain = inner_chain(best[i], best[j])
+            for k in range(bridge_count):
+                nk = (k + 1) % bridge_count
+                ii = best_inner_ids[k]
+                jj = best_inner_ids[nk]
+                ai = best[k]
+                aj = best[nk]
+                outer_chain = _forward_outer_chain(ai, aj)
+                inner_part = inner_chain(ii, jj)
 
-                # Broad sector bounded by one outer edge and the corresponding
-                # inner polygon arc. No radial fan from every Line vertex.
-                loop = [outer[i], outer[j]] + list(reversed(chain))
+                loop = list(outer_chain) + list(reversed(inner_part))
                 clean = []
                 for vert in loop:
                     if not clean or clean[-1] is not vert:
@@ -445,7 +522,7 @@ class LineTool(SketchToolBase):
                 if len(clean) > 1 and clean[0] is clean[-1]:
                     clean.pop()
                 if len(set(clean)) < 3:
-                    raise RuntimeError("degenerate Line ring sector")
+                    raise RuntimeError("degenerate sparse Line ring sector")
                 ring_loops.append(tuple(clean))
 
             # Only now remove the original face.
@@ -461,7 +538,7 @@ class LineTool(SketchToolBase):
                     face = bm.faces.new(tuple(reversed(loop)))
                 created.append(face)
 
-            if len(created) != n_outer + 1:
+            if len(created) != bridge_count + 1:
                 raise RuntimeError("Line closed-loop reconstruction incomplete")
 
             for face in bm.faces:
@@ -477,7 +554,7 @@ class LineTool(SketchToolBase):
             debug_print(
                 "SketchTools Line: dedicated closed-loop cut",
                 "inner_points=", n_inner,
-                "outer_sectors=", n_outer,
+                "sparse_sectors=", bridge_count,
             )
             return True
 
@@ -510,6 +587,156 @@ class LineTool(SketchToolBase):
                 repr(exc),
             )
             return False
+
+
+    def _point_on_face_boundary_local(self, face, point, tol=3e-5):
+        """Return True when local-space *point* lies on any boundary edge of face."""
+        p = Vector(point)
+        for edge in face.edges:
+            a = edge.verts[0].co
+            b = edge.verts[1].co
+            ab = b - a
+            if ab.length_squared <= 1e-16:
+                continue
+            t = max(0.0, min(1.0, (p - a).dot(ab) / ab.length_squared))
+            if (p - (a + ab * t)).length <= tol:
+                return True
+        return False
+
+    def _face_contains_chain_local(self, face, points_local, tol=4e-5):
+        """Planar point-in-polygon test including boundary points."""
+        if face is None or len(face.verts) < 3 or not points_local:
+            return False
+        normal = face.normal.normalized()
+        origin = face.verts[0].co.copy()
+        if any(abs(normal.dot(Vector(p) - origin)) > 2e-4 for p in points_local):
+            return False
+        u = face.verts[1].co - origin
+        if u.length <= 1e-9:
+            return False
+        u.normalize()
+        v = normal.cross(u)
+        if v.length <= 1e-9:
+            return False
+        v.normalize()
+        def xy(p):
+            d = Vector(p) - origin
+            return Vector((d.dot(u), d.dot(v)))
+        poly = [xy(vtx.co) for vtx in face.verts]
+        def on_seg(p, a, b):
+            ab = b - a
+            if ab.length_squared <= 1e-16:
+                return (p-a).length <= tol
+            t = max(0.0, min(1.0, (p-a).dot(ab)/ab.length_squared))
+            return (p-(a+ab*t)).length <= tol
+        def inside(p):
+            for i,a in enumerate(poly):
+                if on_seg(p, a, poly[(i+1)%len(poly)]):
+                    return True
+            hit=False
+            j=len(poly)-1
+            for i in range(len(poly)):
+                a,b=poly[i],poly[j]
+                if ((a.y>p.y)!=(b.y>p.y)):
+                    x=(b.x-a.x)*(p.y-a.y)/(b.y-a.y)+a.x
+                    if p.x < x:
+                        hit=not hit
+                j=i
+            return hit
+        return all(inside(xy(p)) for p in points_local)
+
+    def _topological_closure_face(self, context, end_point):
+        """Find a host cell closed by new chain + an existing boundary path.
+
+        v164 deliberately does not mutate BMesh here.  Start/end may lie in the
+        middle of existing edges; those edges are split later by create_edge()
+        when the completed transaction is committed.
+        """
+        if context.mode != 'EDIT_MESH' or self.edit_free_space:
+            return None
+        # v170: a topological cut does NOT need a closed/new polygon.
+        # Even a single new chord from one host boundary point to another
+        # (Edge -> Edge, Vertex -> Edge, etc.) divides the existing face.
+        # self.points already contains the start and any intermediate anchors;
+        # end_point is the boundary point currently being clicked.
+        if len(self.points) < 1:
+            return None
+        obj = context.edit_object
+        if obj is None or obj.type != 'MESH':
+            return None
+        inv = obj.matrix_world.inverted()
+        chain = [inv @ Vector(p) for p in self.points] + [inv @ Vector(end_point)]
+        if (chain[0] - chain[-1]).length <= 1e-5:
+            return None
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.faces.ensure_lookup_table()
+        candidates=[]
+        for face in bm.faces:
+            if not face.is_valid:
+                continue
+            # Both ends must lie on the SAME existing cell boundary.  That
+            # existing boundary supplies the missing return path (7 -> 1).
+            if not self._point_on_face_boundary_local(face, chain[0]):
+                continue
+            if not self._point_on_face_boundary_local(face, chain[-1]):
+                continue
+
+            # v179: SketchUp-style existing-boundary closure must not require
+            # the newly drawn chain to remain inside the host face.  A common
+            # case is drawing a new polygon OUTSIDE a concave face, starting
+            # at one boundary vertex/edge and ending at another; the existing
+            # face boundary between those endpoints is the missing return path.
+            #
+            # Keep the operation planar with the candidate face, but allow the
+            # intermediate Line points to lie on either side of its 2D polygon.
+            try:
+                normal = face.normal.normalized()
+                origin = face.verts[0].co
+                if any(abs(normal.dot(Vector(p) - origin)) > 2e-4 for p in chain):
+                    continue
+            except Exception:
+                continue
+
+            # Prefer the smallest qualifying cell so an already-intersected
+            # Circle×Rectangle patch is chosen instead of an exterior region.
+            try:
+                area = float(face.calc_area())
+            except Exception:
+                area = 1e30
+            candidates.append((area, face))
+        return min(candidates, key=lambda item:item[0])[1] if candidates else None
+
+    def _finish_current_chain(self, context, dedicated_face_cut=False, topological=False):
+        """Reset Line state after a completed explicit/topological loop."""
+        obj = self.geometry_object if hasattr(self, "geometry_object") else None
+        if obj is not None and context.mode != 'EDIT_MESH':
+            try:
+                if any(poly for poly in obj.data.polygons):
+                    obj.name = "SketchTools Polygon"
+                    obj.data.name = "SketchTools Polygon Mesh"
+            except ReferenceError:
+                pass
+        if context.mode == 'EDIT_MESH':
+            debug_print(
+                "SketchTools Line: Edit Mode loop finalized by "
+                + ("topological closure through existing boundary" if topological else
+                   "dedicated host-face cut" if dedicated_face_cut else
+                   "clean planar graph retopology")
+            )
+        self.preview.clear()
+        self.start_point = None
+        self.end_point = None
+        self.drawing_plane_point = None
+        self.drawing_plane_normal = None
+        self.points.clear()
+        if context.mode != 'EDIT_MESH':
+            self.geometry_object = None
+        self.axis_lock = None
+        self.defer_host_face_topology = False
+        self._last_snap_type = None
+        self.state = "READY"
+        self.set_status(context, "Line: click first point | X/Y/Z after first point: lock axis")
+        debug_print("Polygon finished - Line Tool still active")
 
 
     # -------------------------------------
@@ -653,14 +880,94 @@ class LineTool(SketchToolBase):
     # -------------------------------------
 
     def on_left_click(self, context, event):
+        precision_types = {"ENDPOINT", "MIDPOINT", "CENTER", "EDGE", "ORIGIN"}
+
+        # Resolve the snap before establishing the fallback plane.  This keeps
+        # a visible 3D vertex/edge authoritative instead of first choosing a
+        # nearby screen-facing plane and later projecting the snap onto it.
+        point = self._snap(context, event)
+        acquired_type = self._last_snap_type if point is not None else None
+
         if self.state == "READY":
             plane_point, plane_normal, hit_obj, face_index = object_or_floor_plane(
                 context, event
             )
+            if context.mode == 'EDIT_MESH' and (hit_obj is None or hit_obj != context.edit_object or face_index is None):
+                # v174: ALL Edit-Mode Line chains are transactional while open.
+                # A chain may begin in free space and only cross existing faces later;
+                # committing each intermediate click used to let create_edge() rebuild
+                # the connected planar network and make unrelated faces disappear,
+                # then reappear on a later click.  Keep BMesh completely untouched
+                # until the chain actually terminates/closes.
+                #
+                # If the first click is a precise boundary snap and a linked host face
+                # is available, use that face's plane.  Otherwise retain the normal
+                # free-space fallback plane, but STILL defer topology.
+                snap_result = getattr(self, "_last_snap_result", None)
+
+                # v175: Never dereference the BMVert/BMEdge stored inside a
+                # SnapResult here.  A prior Edit-Mode topology update can invalidate
+                # that BMesh element even though the snapped world coordinate is still
+                # perfectly valid.  Reacquire the host face from the CURRENT BMesh
+                # using only stable data: object identity + exact snapped coordinate.
+                host_face = None
+                boundary_host = False
+                if (
+                    acquired_type in {"ENDPOINT", "MIDPOINT", "EDGE"}
+                    and snap_result is not None
+                    and getattr(snap_result, "obj", None) is context.edit_object
+                    and point is not None
+                ):
+                    try:
+                        bm_now = bmesh.from_edit_mesh(context.edit_object.data)
+                        bm_now.verts.ensure_lookup_table()
+                        bm_now.edges.ensure_lookup_table()
+                        bm_now.faces.ensure_lookup_table()
+                        p_local = context.edit_object.matrix_world.inverted() @ Vector(point)
+
+                        candidates = []
+                        for face in bm_now.faces:
+                            try:
+                                if self._point_on_face_boundary_local(face, p_local, tol=8e-5):
+                                    candidates.append(face)
+                            except ReferenceError:
+                                continue
+
+                        if candidates:
+                            # Prefer the smallest local host cell when several coplanar
+                            # faces share the same snapped vertex/edge.
+                            host_face = min(candidates, key=lambda f: max(float(f.calc_area()), 0.0))
+                            boundary_host = True
+                    except (ReferenceError, RuntimeError, ValueError):
+                        host_face = None
+                        boundary_host = False
+
+                if boundary_host and host_face is not None:
+                    plane_point = context.edit_object.matrix_world @ host_face.verts[0].co
+                    plane_normal = (context.edit_object.matrix_world.to_3x3() @ host_face.normal).normalized()
+                    self.edit_free_space = False
+                else:
+                    plane_point, plane_normal = view_fallback_plane(context)
+                    self.edit_free_space = True
+                self.defer_host_face_topology = True
+            else:
+                self.edit_free_space = False
+                # v174: even a chain that starts directly on a visible host face
+                # remains preview-only until a real completion event.
+                self.defer_host_face_topology = (context.mode == 'EDIT_MESH')
             self.drawing_plane_point = Vector(plane_point)
             self.drawing_plane_normal = Vector(plane_normal).normalized()
 
-        point = self._snap(context, event)
+            # In Object Mode start the working plane through the exact acquired
+            # geometry coordinate.  Its normal is still the sensible face/view
+            # normal selected above, so ordinary free drawing remains familiar.
+            if (
+                point is not None
+                and context.mode != 'EDIT_MESH'
+                and acquired_type in precision_types
+            ):
+                self.drawing_plane_point = Vector(point).copy()
+
         if point is None:
             point = mouse_to_plane(
                 context,
@@ -668,6 +975,7 @@ class LineTool(SketchToolBase):
                 self.drawing_plane_point,
                 self.drawing_plane_normal,
             )
+            acquired_type = None
 
         if point is None:
             debug_print("Invalid point")
@@ -676,19 +984,28 @@ class LineTool(SketchToolBase):
         if self.state == "DRAWING" and self.axis_lock is None:
             point = self._equal_length_inference(context, event, point)
 
-        # Planar snaps stay on the established drawing plane. In Perspective
-        # Object Mode, a true X/Y/Z inference is intentionally allowed to
-        # leave that plane (e.g. drawing vertically on world Z).
-        if self._last_snap_type not in {
-            "X_AXIS", "Y_AXIS", "Z_AXIS",
-            "X_GRID", "Y_GRID", "Z_GRID",
-        }:
+        # v100: geometry snaps are authoritative in Object Mode.  Do not show
+        # "Endpoint" and then numerically move the click onto the drawing plane.
+        # Edit Mode stays planar because its purpose is cutting the hit surface.
+        preserve_exact = (
+            context.mode != 'EDIT_MESH'
+            and acquired_type in precision_types
+        )
+        if (
+            not preserve_exact
+            and self._last_snap_type not in {
+                "X_AXIS", "Y_AXIS", "Z_AXIS",
+                "X_GRID", "Y_GRID", "Z_GRID",
+            }
+        ):
             delta = Vector(point) - self.drawing_plane_point
             point = Vector(point) - self.drawing_plane_normal * delta.dot(self.drawing_plane_normal)
 
         if self.state == "READY":
             self.start_point = point
             self.points.append(point)
+            if self.defer_host_face_topology:
+                self.preview.set_chain_points(self.points)
             self.state = "DRAWING"
             self.set_status(context, "Line: click next point | X/Y/Z: lock axis")
             debug_print("Line started:", point)
@@ -699,7 +1016,25 @@ class LineTool(SketchToolBase):
             if len(self.points) >= 3 and (point - self.points[0]).length < 1e-4:
                 debug_print("Polygon closed")
                 self.end_point = self.points[0]
-                self.create_line(context)
+
+                # v161 — closed Line polygon drawn wholly on an existing Edit
+                # Mode face gets a dedicated local face subdivision.  The
+                # general v137 Line graph remains the authority for crossings
+                # and free-space polygons; this narrow path is used only when
+                # one containing coplanar host face can be identified.
+                dedicated_face_cut = False
+                if context.mode == 'EDIT_MESH' and not self.edit_free_space:
+                    try:
+                        dedicated_face_cut = self._cut_closed_loop_edit_mode(context)
+                    except Exception as exc:
+                        debug_print("SketchTools Line v161 host-face cut failed:", repr(exc))
+                        dedicated_face_cut = False
+
+                if not dedicated_face_cut:
+                    if context.mode == 'EDIT_MESH' and self.defer_host_face_topology:
+                        self._commit_deferred_chain_edit_mode(context, close_loop=True)
+                    else:
+                        self.create_line(context)
 
                 obj = self.geometry_object if hasattr(self, "geometry_object") else None
                 if obj is not None:
@@ -710,23 +1045,27 @@ class LineTool(SketchToolBase):
                     # face here would lay a duplicate coplanar polygon over that
                     # region and cause z-fighting/striping.
                     if context.mode != 'EDIT_MESH':
-                        create_face_from_points(obj, self.points)
+                        # v130: create_edge() already performs live minimal-cell
+                        # filling.  Do not lay a second polygon over that topology.
+                        # Finalize this chain as its own Blender object, then the
+                        # next Line chain will allocate a fresh object.
+                        try:
+                            if any(poly for poly in obj.data.polygons):
+                                obj.name = "SketchTools Polygon"
+                                obj.data.name = "SketchTools Polygon Mesh"
+                        except ReferenceError:
+                            pass
                     else:
-                        # Use the same closed-loop surface reconstruction that
-                        # Freehand uses successfully. The Line chain is already
-                        # exact/low-density, so this creates an independently
-                        # selectable inner region while preserving the outer
-                        # surface and avoiding a duplicate coplanar face.
-                        if self._cut_closed_loop_edit_mode(context):
-                            debug_print(
-                                "SketchTools Line: closed Edit Mode loop "
-                                "converted to dedicated surface topology"
-                            )
-                        else:
-                            debug_print(
-                                "SketchTools Line: dedicated closed-loop cut "
-                                "was not applicable; keeping autocut edges"
-                            )
+                        # v136: every Edit-Mode segment, including the closing
+                        # segment, is already handled by create_edge()'s clean
+                        # planar-graph retopology.  Do NOT run the legacy second
+                        # face/cutter pipeline here: that competing closure path
+                        # was able to recreate the external/spanning faces seen
+                        # in v130-v135.
+                        debug_print(
+                            "SketchTools Line: Edit Mode loop finalized by "
+                            + ("dedicated host-face cut" if dedicated_face_cut else "clean planar graph retopology")
+                        )
 
                 self.preview.clear()
                 self.start_point = None
@@ -734,23 +1073,53 @@ class LineTool(SketchToolBase):
                 self.drawing_plane_point = None
                 self.drawing_plane_normal = None
                 self.points.clear()
+                if context.mode != 'EDIT_MESH':
+                    # The completed polygon remains independent.  The next
+                    # Object-Mode chain must not reuse it.
+                    self.geometry_object = None
                 self.axis_lock = None
+                self.defer_host_face_topology = False
                 self._last_snap_type = None
                 self.state = "READY"
                 self.set_status(context, "Line: click first point | X/Y/Z after first point: lock axis")
                 debug_print("Polygon finished - Line Tool still active")
                 return
 
+            # v170 SketchUp-style boundary termination: if the current click
+            # lands anywhere on the boundary of the same existing host cell as
+            # the chain start, the existing mesh boundary supplies the return
+            # path. This includes direct Edge->Edge chords and multi-segment
+            # Vertex/Edge/Midpoint combinations; no redraw back to the start.
+            topo_face = self._topological_closure_face(context, point)
+            if topo_face is not None and self.defer_host_face_topology:
+                debug_print("Topological Line cut terminated on existing boundary")
+                self.end_point = Vector(point).copy()
+                self.points.append(Vector(point).copy())
+                # Commit ONLY the newly drawn chain. _autocut_edge_bmesh splits
+                # start/end host edges at their exact On Edge positions; v137
+                # local planar retopology then recognizes the new bounded cell.
+                self._commit_deferred_chain_edit_mode(context, close_loop=False)
+                self._finish_current_chain(context, topological=True)
+                return
+
             self.end_point = point
             debug_print("Adding Point:", point)
             segment_start = Vector(self.start_point).copy()
             segment_end = Vector(point).copy()
-            self.create_line(context)
+            if context.mode == 'EDIT_MESH' and self.defer_host_face_topology:
+                # v163: display/store the segment only. Do not call create_edge()
+                # because its live planar rebuild can temporarily delete a host
+                # cell created by Circle×Rectangle or other prior intersections.
+                pass
+            else:
+                self.create_line(context)
             self.last_segment_start = segment_start
             self.last_segment_end = segment_end
             self.last_segment_obj_name = self.geometry_object.name if self.geometry_object is not None else None
             self.length_input = ""
             self.points.append(point)
+            if self.defer_host_face_topology:
+                self.preview.set_chain_points(self.points)
             self.start_point = point
             self._last_snap_type = None
             self.preview.clear_equal_length_guide()
@@ -774,9 +1143,22 @@ class LineTool(SketchToolBase):
         event
     ):
 
-        debug_print(
-            "Line chain cancelled"
-        )
+        # v174: prior to the all-transactional Edit-Mode change, each clicked
+        # segment had already been committed before RMB ended the chain.  Preserve
+        # that user-visible behaviour: RMB ends an open transactional chain and
+        # commits all accepted points once, rather than silently discarding them.
+        if context.mode == 'EDIT_MESH' and self.defer_host_face_topology and len(self.points) >= 2:
+            try:
+                # v176: RMB finishing an OPEN interior chain is a wire-only
+                # commit.  Running v137 whole-planar-cell reconstruction here
+                # created the unwanted long corner diagonals/fans seen when a
+                # simple Z was drawn on a face.
+                self._commit_deferred_chain_wire_edit_mode(context)
+                debug_print("Line open transactional chain committed on RMB (wire-only)")
+            except Exception as exc:
+                debug_print("SketchTools Line v174 RMB commit failed:", repr(exc))
+        else:
+            debug_print("Line chain cancelled")
         
         self.preview.clear()
 
@@ -790,6 +1172,7 @@ class LineTool(SketchToolBase):
 
         self.state = "READY"
         self.axis_lock = None
+        self.defer_host_face_topology = False
         self.set_status(context, "Line: click first point | X/Y/Z after first point: lock axis")
 
         debug_print(
@@ -981,25 +1364,93 @@ class LineTool(SketchToolBase):
     # Create Geometry
     # -------------------------------------
 
+    def _commit_deferred_chain_wire_edit_mode(self, context):
+        """Commit an OPEN transactional Line chain without planar face rebuild.
+
+        v176: an unfinished/open polyline drawn across the interior of a face
+        (for example a Z) must not force Blender to invent bridge diagonals to
+        distant host-boundary vertices.  Insert/split only the geometry that the
+        user actually drew and leave existing faces intact.  If the chain later
+        reaches a valid host boundary, the normal topological-closure path is
+        used instead and performs the real face split.
+        """
+        obj = context.edit_object
+        if obj is None or obj.type != 'MESH' or len(self.points) < 2:
+            return False
+
+        inv = obj.matrix_world.inverted()
+        pts = [inv @ Vector(p) for p in self.points]
+        bm = bmesh.from_edit_mesh(obj.data)
+        changed = False
+        for a, b in zip(pts, pts[1:]):
+            if (b - a).length <= 1e-7:
+                continue
+            changed = _autocut_edge_bmesh(bm, a, b) or changed
+
+        bm.normal_update()
+        bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
+        self.geometry_object = obj
+        context.view_layer.update()
+        debug_print("Line v176 open wire committed without host-face retopology")
+        return changed
+
+
+    def _commit_deferred_chain_edit_mode(self, context, close_loop=False):
+        """Commit a v163 transactional Edit-Mode chain only when needed.
+
+        This fallback is used when a chain began on a face but did not qualify
+        for the dedicated contained host-face cut (for example it crossed out
+        of that face). All coordinates are stored as plain vectors, so no stale
+        BMesh element references survive between topology operations.
+        """
+        obj = context.edit_object
+        if obj is None or obj.type != 'MESH' or len(self.points) < 2:
+            return False
+        pts = [Vector(p).copy() for p in self.points]
+        if close_loop and len(pts) >= 3:
+            pts.append(pts[0].copy())
+        for a, b in zip(pts, pts[1:]):
+            if (b - a).length <= 1e-7:
+                continue
+            create_edge(obj, a, b)
+        self.geometry_object = obj
+        context.view_layer.update()
+        return True
+
+
     def create_line(
         self,
         context
     ):
 
+        # v127: Blender RNA references can outlive the object they point to.
+        # Never dereference a cached geometry object until it has been proven
+        # alive; an empty scene after deleting SketchTools Geometry used to
+        # raise: ReferenceError: StructRNA of type Object has been removed.
         obj = self.geometry_object
-        
-        if obj is None:
-            
-            obj = context.active_object
+        try:
+            cached_valid = obj is not None and obj.name in bpy.data.objects and obj.type == "MESH"
+        except ReferenceError:
+            cached_valid = False
+            obj = None
 
-        if obj is None or obj.type != "MESH":
+        if not cached_valid:
+            if context.mode == 'EDIT_MESH':
+                obj = context.edit_object
+                try:
+                    active_valid = obj is not None and obj.name in bpy.data.objects and obj.type == "MESH"
+                except ReferenceError:
+                    active_valid = False
+                    obj = None
+                if not active_valid:
+                    debug_print("Line: no valid Edit Mode mesh object")
+                    return
+            else:
+                # v130: every Object-Mode drawing chain owns a fresh mesh.
+                # Never append Line geometry to an arbitrary active object.
+                obj = _create_object_mode_line_object(context)
+                debug_print("Created fresh SketchTools Line object")
 
-            obj = get_or_create_geometry_object()
-
-            debug_print(
-                "Using SketchTools Geometry"
-            )
-        
         self.geometry_object = obj
         
         
@@ -1075,6 +1526,13 @@ class LineTool(SketchToolBase):
         self.last_segment_obj_name = None
         self.length_input = ""
         self.axis_lock = None
+        self.edit_free_space = False
+        self.defer_host_face_topology = False
+
+        # v126: automatic axis inference is transient UI state.  It must not
+        # survive cancel/tool-switch and reappear when Line is selected again.
+        self._last_snap_type = None
+        self._last_axis_direction = None
         
         self.state = "READY"
         

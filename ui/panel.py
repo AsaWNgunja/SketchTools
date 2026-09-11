@@ -22,6 +22,12 @@ class SketchToolsPanel(bpy.types.Panel):
 
         box.prop(
             context.scene,
+            "sketchtools_circle_radius",
+            text="Circle Radius",
+        )
+
+        box.prop(
+            context.scene,
             "sketchtools_freehand_spacing",
             text="Freehand Spacing",
         )
